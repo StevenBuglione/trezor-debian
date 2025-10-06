@@ -1,4 +1,4 @@
-# ==== Base: minimal live + X stack (no browsers) ====
+# ==== Base: minimal live (no browsers) ====
 %include __KSDIR__/fedora-live-minimization.ks
 
 # ==== Users / auth / services ====
@@ -9,27 +9,30 @@ selinux --enforcing
 firewall --disabled
 firstboot --disable
 
-# Display manager & session
+# Display manager & graphical login
 services --enabled="sddm" --disabled="sshd,NetworkManager-wait-online,avahi-daemon,cups,ModemManager"
+xconfig --startxonboot   # (valid kickstart directive; don't try defaultdesktop=lxqt)
 
-# Make sure we boot to graphical
-skipx --defaultdesktop=lxqt
-
-# ==== Packages: only what we need for LXQt + Trezor ====
+# ==== Packages: minimal LXQt Wayland + Trezor ====
 %packages
-@base-x
+# LXQt core
 lxqt-session
 lxqt-panel
 lxqt-policykit
 lxqt-themes
-openbox
+
+# Wayland session + default compositor (miriway) and Xwayland shim
+lxqt-wayland-session
+lxqt-wayland-session-default-compositor-miriway
+xorg-x11-server-Xwayland
+
+# DM and a tiny terminal
 sddm
-xorg-x11-server-Xorg
-xorg-x11-xinit
 xterm
 dejavu-sans-fonts
 dejavu-serif-fonts
 
+# Trezor + helpers
 trezor-common
 fuse-libs
 curl
@@ -45,17 +48,17 @@ set -euo pipefail
 
 LIVE_ROOT="/mnt/sysimage"
 SRC_VENDOR="/workspace/scripts/fedora-live/vendor"
-SRC_SCRIPTS="/workspace/trezor-scripts"   # <— put your scripts in this folder at repo root
+SRC_SCRIPTS="/workspace/trezor-scripts"
 
-# 1) Autologin into LXQt via SDDM
+# 1) SDDM autologin into LXQt Wayland
 install -d -m0755 "${LIVE_ROOT}/etc/sddm.conf.d"
 cat > "${LIVE_ROOT}/etc/sddm.conf.d/10-autologin.conf" <<'EOF'
 [Autologin]
 User=trezor
-Session=lxqt.desktop
+Session=lxqt-wayland.desktop
 EOF
 
-# 2) Ensure dirs for app + scripts + autostart
+# 2) Ensure dirs
 install -d -m0755 "${LIVE_ROOT}/opt/trezor"
 install -d -m0755 "${LIVE_ROOT}/opt/trezor-scripts"
 install -d -m0755 "${LIVE_ROOT}/usr/share/applications"
@@ -67,7 +70,7 @@ install -d -m0755 "${LIVE_ROOT}/etc/xdg/autostart"
 [ -f "${SRC_VENDOR}/trezor-suite.AppImage.asc" ] && install -m0644 "${SRC_VENDOR}/trezor-suite.AppImage.asc" "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage.asc" || true
 [ -f "${SRC_VENDOR}/trezor.asc" ]                && install -m0644 "${SRC_VENDOR}/trezor.asc"                "${LIVE_ROOT}/opt/trezor/trezor.asc"                || true
 
-# 4) Bundle YOUR repo scripts into the image (excludes VCS junk), make executable
+# 4) Bundle your repo scripts (excludes VCS junk), make executable
 if [ -d "${SRC_SCRIPTS}" ]; then
   rsync -a --delete \
     --exclude ".git" --exclude ".github" --exclude ".gitmodules" \
@@ -94,10 +97,7 @@ if [ ! -x "$APP" ]; then
   echo "Trezor Suite missing. Fetching latest for $ARCH …"
   URL="$(curl -fsSL https://api.github.com/repos/trezor/trezor-suite/releases/latest \
         | jq -r --arg rx "$RX" '.assets[] | select(.name|test($rx)) | .browser_download_url' | head -n1)"
-  if [ -z "$URL" ]; then
-    echo "Could not determine AppImage URL for $ARCH." >&2
-    exit 1
-  fi
+  [ -n "$URL" ] || { echo "Could not determine AppImage URL for $ARCH." >&2; exit 1; }
   TMP="$(mktemp)"
   curl -fsSL -L "$URL" -o "$TMP"
   sudo install -m0755 "$TMP" "$APP"
@@ -108,7 +108,7 @@ exec "$APP" --no-sandbox "$@"
 EOS
 chmod +x "${LIVE_ROOT}/usr/local/bin/trezor-suite"
 
-# 6) Desktop launcher (always present; launches wrapper)
+# 6) Desktop launcher (always present)
 cat > "${LIVE_ROOT}/usr/share/applications/trezor-suite.desktop" <<'EOF'
 [Desktop Entry]
 Name=Trezor Suite
@@ -119,7 +119,7 @@ Type=Application
 Categories=Finance;Utility;
 EOF
 
-# 7) Auto-start Trezor Suite at login (optional; comment out to disable)
+# 7) Optional: auto-start Trezor after login
 cat > "${LIVE_ROOT}/etc/xdg/autostart/trezor-suite.desktop" <<'EOF'
 [Desktop Entry]
 Name=Trezor Suite (Auto)
@@ -131,7 +131,6 @@ EOF
 # 8) Shell setup: add /opt/trezor-scripts to PATH; helper alias
 for HOMEBASE in "${LIVE_ROOT}/etc/skel" "${LIVE_ROOT}/home/trezor"; do
   install -d -m0755 "${HOMEBASE}"
-  # Ensure .bash_profile sources .bashrc
   if ! grep -q 'if \[ -f ~/.bashrc \]' "${HOMEBASE}/.bash_profile" 2>/dev/null; then
     cat >> "${HOMEBASE}/.bash_profile" <<'RC'
 if [ -f ~/.bashrc ]; then
@@ -139,14 +138,13 @@ if [ -f ~/.bashrc ]; then
 fi
 RC
   fi
-  # Add scripts PATH and an alias
   cat >> "${HOMEBASE}/.bashrc" <<'RC'
 export PATH="/opt/trezor-scripts:$HOME/bin:$PATH"
 alias update-trezor-suite='/usr/local/bin/update-trezor-suite'
 RC
 done
 
-# 9) System-wide updater (kept, but you can ship your own script too)
+# 9) System-wide updater (you can replace with your own script)
 cat > "${LIVE_ROOT}/usr/local/bin/update-trezor-suite" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -169,7 +167,7 @@ echo "Updated Trezor Suite at $APP"
 EOS
 chmod +x "${LIVE_ROOT}/usr/local/bin/update-trezor-suite"
 
-# 10) Set ownership for trezor's home
+# 10) Ownership for trezor's home
 chroot "${LIVE_ROOT}" /usr/sbin/usermod -d /home/trezor -s /bin/bash trezor || true
 chroot "${LIVE_ROOT}" /usr/bin/chown -R trezor:trezor /home/trezor || true
 %end
