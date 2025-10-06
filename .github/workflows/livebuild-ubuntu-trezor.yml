@@ -23,24 +23,21 @@ jobs:
     timeout-minutes: 120
     defaults:
       run:
-        shell: bash  # ensure bash for heredocs and [[ ]]
-
+        shell: bash
     env:
-      # Mirrors
       UBUNTU_MIRROR: "http://archive.ubuntu.com/ubuntu/"
       UBUNTU_SECURITY: "http://security.ubuntu.com/ubuntu/"
-      # Keys
       TREZOR_SIGNING_KEYID: "0x86E0D76E6D53CAC6"
-      # Output name
       TAILORED_ISO_NAME: "ubuntu-live-trezor.iso"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Runner info
+      - name: Runner info (and set debug trap)
         run: |
-          set -euxo pipefail
+          set -Eeuo pipefail
+          trap 'CODE=$?; echo "::group::DEBUG FAIL CONTEXT"; echo "Step failed with exit code: $CODE"; echo "PWD: $(pwd)"; echo "Tree:"; find -maxdepth 4 -type d -printf "%p\n"; echo "Files under config/:"; find config -type f -maxdepth 4 -print 2>/dev/null || true; echo "::endgroup::"; exit $CODE' ERR
           uname -a || true
           lsb_release -a || true
           df -h || true
@@ -69,10 +66,9 @@ jobs:
           echo "DISABLE_NET=$DISABLE_NET" >> "$GITHUB_OUTPUT"
           echo "VOL=UBUNTU_${CODENAME}_TREZOR" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare live-build config (heredocs fixed)
+      - name: Clean & create config dirs
         run: |
           set -euxo pipefail
-
           sudo lb clean || true
           rm -rf config build-cache logs || true
           mkdir -p config/includes.chroot/opt/trezor
@@ -82,7 +78,10 @@ jobs:
           mkdir -p config/hooks/normal
           mkdir -p logs
 
-          # package list (make sure AppImage can run)
+      # ---- Write files in separate steps to avoid heredoc pitfalls ----
+      - name: Write package list (base.list.chroot)
+        run: |
+          set -euxo pipefail
           cat > config/package-lists/base.list.chroot <<'EOF'
           ubuntu-standard
           casper
@@ -96,13 +95,17 @@ jobs:
           udev
           EOF
 
-          # udev rules for Trezor (permissive for ephemeral live session)
+      - name: Write udev rules (51-trezor.rules)
+        run: |
+          set -euxo pipefail
           cat > config/includes.chroot/etc/udev/rules.d/51-trezor.rules <<'EOF'
           SUBSYSTEM=="hidraw", ATTRS{idVendor}=="534c", MODE="0666"
           SUBSYSTEM=="usb",   ATTR{idVendor}=="534c", MODE="0666"
           EOF
 
-          # Desktop launcher
+      - name: Write desktop launcher (trezor-suite.desktop)
+        run: |
+          set -euxo pipefail
           cat > config/includes.chroot/usr/share/applications/trezor-suite.desktop <<'EOF'
           [Desktop Entry]
           Name=Trezor Suite
@@ -113,22 +116,44 @@ jobs:
           Terminal=false
           EOF
 
-          # Optional: disable networking by default
-          if [[ "${{ steps.vars.outputs.DISABLE_NET }}" == "true" ]]; then
-            mkdir -p config/includes.chroot/etc/NetworkManager/conf.d
-            cat > config/includes.chroot/etc/NetworkManager/conf.d/00-offline.conf <<'EOF'
-            [main]
-            networking=false
-            EOF
-          fi
+      - name: Optionally disable networking by default
+        if: ${{ steps.vars.outputs.DISABLE_NET == 'true' }}
+        run: |
+          set -euxo pipefail
+          mkdir -p config/includes.chroot/etc/NetworkManager/conf.d
+          cat > config/includes.chroot/etc/NetworkManager/conf.d/00-offline.conf <<'EOF'
+          [main]
+          networking=false
+          EOF
 
-          # Hook: refresh initramfs
+      - name: Hook to refresh initramfs
+        run: |
+          set -euxo pipefail
           cat > config/hooks/normal/99-update-initramfs.chroot <<'EOF'
           #!/bin/sh
           set -eux
           update-initramfs -u
           EOF
           chmod +x config/hooks/normal/99-update-initramfs.chroot
+
+      # ---- Debug: show written files with line numbers ----
+      - name: Debug print written files
+        run: |
+          set -euxo pipefail
+          echo "::group::config/package-lists/base.list.chroot"
+          nl -ba config/package-lists/base.list.chroot
+          echo "::endgroup::"
+          echo "::group::udev rules"
+          nl -ba config/includes.chroot/etc/udev/rules.d/51-trezor.rules
+          echo "::endgroup::"
+          echo "::group::desktop file"
+          nl -ba config/includes.chroot/usr/share/applications/trezor-suite.desktop
+          echo "::endgroup::"
+          if [[ "${{ steps.vars.outputs.DISABLE_NET }}" == "true" ]]; then
+            echo "::group::NetworkManager default-off"
+            nl -ba config/includes.chroot/etc/NetworkManager/conf.d/00-offline.conf
+            echo "::endgroup::"
+          fi
 
       - name: Fetch & verify latest Trezor Suite
         run: |
@@ -149,6 +174,7 @@ jobs:
           popd
 
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
+          echo "::group::Verify AppImage presence"; ls -l config/includes.chroot/opt/trezor/; echo "::endgroup::"
 
       - name: Configure live-build
         run: |
@@ -172,18 +198,18 @@ jobs:
             --iso-application "Ubuntu Live (Trezor Suite)" \
             --iso-volume "${{ steps.vars.outputs.VOL }}" \
             --checksums "sha256"
+          echo "::group::lb config show"; cat config/* 2>/dev/null || true; echo "::endgroup::"
 
       - name: Build ISO (verbose)
         run: |
           set -euxo pipefail
           (time sudo lb build) 2>&1 | tee logs/live-build.log
-          ls -lh *.iso || { echo "No ISO produced"; exit 3; }
+          echo "::group::List ISOs"; ls -lh *.iso || true; echo "::endgroup::"
           LB_OUT=$(ls -1 *.iso | head -n1)
-          echo "LB_OUT=${LB_OUT}"
           cp "${LB_OUT}" "${TAILORED_ISO_NAME}"
           sha256sum "${TAILORED_ISO_NAME}" | tee ubuntu-live-trezor.iso.sha256
 
-      - name: Collect and upload artifacts
+      - name: Upload ISO + checksums + logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -195,6 +221,7 @@ jobs:
           retention-days: 21
 
       - name: Create Release
+        if: ${{ success() }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: livebuild-${{ steps.vars.outputs.CODENAME }}-${{ github.run_id }}
