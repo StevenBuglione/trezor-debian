@@ -1,14 +1,14 @@
-name: Remaster Fedora Live ISO with Trezor Suite (official path)
+name: Fedora Live ISO with Trezor Suite
 
 on:
   workflow_dispatch:
     inputs:
       fedora_major:
-        description: 'Fedora major version (e.g., 41). Leave empty for latest container.'
+        description: 'Fedora release (e.g., 42). Leave empty for latest container.'
         required: false
         default: ""
       trezor_tag:
-        description: 'Optional: Trezor Suite tag (e.g., v25.9.3). Empty = latest.'
+        description: 'Optional Trezor Suite tag (e.g., v25.9.3). Empty = latest.'
         required: false
         default: ""
   schedule:
@@ -18,147 +18,139 @@ permissions:
   contents: read
 
 jobs:
-  build-fedora-live:
-    # Run the whole job inside Fedora so we can use dnf + livecd-creator directly
+  build:
     runs-on: ubuntu-24.04
-    container:
-      image: fedora:latest
-
     env:
       ISO_LABEL: FEDORA_TREZOR
       ISO_BASENAME: fedora-live-trezor
-      # SatoshiLabs 2021 signing key (must match VALIDISG)
-      TREZOR_FPR: EB483B26B078A4AA1B6F425EE21B6950A2ECB65C
-      TREZOR_KEY_URL: https://trezor.io/security/satoshilabs-2021-signing-key.asc
-
+      TREZOR_FPR: "EB483B26B078A4AA1B6F425EE21B6950A2ECB65C"
+      TREZOR_KEY_URL: "https://trezor.io/security/satoshilabs-2021-signing-key.asc"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install official live image toolchain
+      - name: Build in a privileged Fedora container (lorax + pykickstart)
         run: |
           set -euo pipefail
-          dnf -y update
-          # Official path per Fedora Quick Docs: livecd-creator + spin-kickstarts + ksflatten
-          dnf -y install livecd-tools spin-kickstarts pykickstart \
-                         xorriso isomd5sum squashfs-tools \
-                         jq curl gnupg2
-          rpm -E '%fedora' | tee FEDORA_VER.txt
+          FED="${{ github.event.inputs.fedora_major }}"
+          IMG="fedora:${FED:-latest}"
 
-      - name: Create Kickstart overlay (adds Trezor + AppImage fetch & verify)
-        run: |
-          set -euo pipefail
-          FEDORA_VER=$(cat FEDORA_VER.txt)
-          TREZOR_TAG="${{ github.event.inputs.trezor_tag }}"
+          # Run privileged so lmc can use loop + mounts
+          docker run --rm --privileged \
+            -e ISO_LABEL="${ISO_LABEL}" \
+            -e ISO_BASENAME="${ISO_BASENAME}" \
+            -e TREZOR_FPR="${TREZOR_FPR}" \
+            -e TREZOR_KEY_URL="${TREZOR_KEY_URL}" \
+            -e TREZOR_TAG="${{ github.event.inputs.trezor_tag }}" \
+            -v "$PWD":/workspace -w /workspace "${IMG}" bash -lc '
+              set -euo pipefail
 
-          cat > trezor-overlay.ks <<'KS'
-          # Include the official Workstation live configuration (Fedora 21+)
-          %include /usr/share/spin-kickstarts/fedora-live-workstation.ks
+              dnf -y update
+              # Official toolchain: Lorax (livemedia-creator), pykickstart (ksflatten), git, etc.
+              dnf -y install lorax-lmc-novirt pykickstart git jq curl gnupg2 ca-certificates xorriso
 
-          # Ensure tools we need inside the image
-          %packages
-          # udev rules for Trezor (official Fedora package)
-          trezor-common
-          # AppImage needs FUSE v2 (libfuse.so.2) on Fedora -> fuse-libs provides it
-          fuse-libs
-          # fetch/verify helpers used in %post
-          curl
-          jq
-          gnupg2
-          %end
+              FEDORA_VER=$(rpm -E %fedora)
+              echo "Fedora detected: $FEDORA_VER"
 
-          %post --log=/root/trezor-post.log
-          set -euo pipefail
+              # Get kickstarts from Pagure (spin-kickstarts RPM is not available on F42+)
+              git clone --depth 1 https://pagure.io/fedora-kickstarts.git
+              cd fedora-kickstarts
+              if git ls-remote --exit-code --heads origin "f${FEDORA_VER}" >/dev/null 2>&1; then
+                git fetch origin "f${FEDORA_VER}" && git checkout "f${FEDORA_VER}"
+              else
+                echo "Branch f${FEDORA_VER} not found; using main."
+              fi
+              KSDIR="$(pwd)"
+              cd -
 
-          TREZOR_TAG="@TREZOR_TAG@"
-          TREZOR_KEY_URL="@TREZOR_KEY_URL@"
-          TREZOR_FPR="@TREZOR_FPR@"
+              # Create our overlay kickstart that includes Workstation base, adds trezor + AppImage install in %post
+              cat > trezor-overlay.ks <<KS
+              %include ${KSDIR}/fedora-live-workstation.ks
 
-          mkdir -p /opt/trezor
-          cd /opt/trezor
+              %packages
+              trezor-common
+              fuse-libs
+              curl
+              jq
+              gnupg2
+              ca-certificates
+              %end
 
-          # Import SatoshiLabs signing key
-          curl -fsSL "$TREZOR_KEY_URL" -o trezor.asc
-          gpg2 --batch --import trezor.asc || gpg --batch --import trezor.asc
+              %post --log=/root/trezor-post.log
+              set -euo pipefail
+              TREZOR_TAG="${TREZOR_TAG:-}"
+              TREZOR_KEY_URL="${TREZOR_KEY_URL}"
+              TREZOR_FPR="${TREZOR_FPR}"
 
-          # Pick release (latest or pinned tag) and fetch AppImage + .asc
-          if [ -n "$TREZOR_TAG" ]; then
-            REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/${TREZOR_TAG}"
-          else
-            REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/latest"
-          fi
+              mkdir -p /opt/trezor
+              cd /opt/trezor
 
-          curl -fsSL "$REL_API" -o /tmp/release.json
-          APP_URL=$(jq -r '.assets[] | select(.name|test("linux.*AppImage$")) | .browser_download_url' /tmp/release.json | head -n1)
-          ASC_URL=$(jq -r '.assets[] | select(.name|test("linux.*AppImage.asc$")) | .browser_download_url' /tmp/release.json | head -n1)
-          [ -n "$APP_URL" ] && [ -n "$ASC_URL" ] || { echo "Could not locate AppImage or .asc in release assets"; exit 12; }
+              curl -fsSL "\$TREZOR_KEY_URL" -o trezor.asc
+              gpg2 --batch --import trezor.asc || gpg --batch --import trezor.asc
 
-          curl -fsSLo trezor-suite.AppImage "$APP_URL"
-          curl -fsSLo trezor-suite.AppImage.asc "$ASC_URL"
-          chmod +x trezor-suite.AppImage
+              if [ -n "\$TREZOR_TAG" ]; then
+                REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/\$TREZOR_TAG"
+              else
+                REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/latest"
+              fi
+              curl -fsSL "\$REL_API" -o /tmp/release.json
 
-          # Verify signature and *pin* the fingerprint
-          gpg2 --batch --status-fd=1 --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
-            1> /tmp/gpg-status.log 2> /tmp/gpg-stderr.log || true
-          SIG_FPR=$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' /tmp/gpg-status.log)
-          [ -n "$SIG_FPR" ] && [ "$SIG_FPR" = "$TREZOR_FPR" ] || { echo "Signature fingerprint mismatch: $SIG_FPR"; exit 14; }
+              APP_URL=\$(jq -r '\''.assets[] | select(.name|test("linux.*AppImage$")) | .browser_download_url'\'' /tmp/release.json | head -n1)
+              ASC_URL=\$(jq -r '\''.assets[] | select(.name|test("linux.*AppImage.asc$")) | .browser_download_url'\'' /tmp/release.json | head -n1)
+              [ -n "\$APP_URL" ] && [ -n "\$ASC_URL" ] || { echo "Trezor Suite AppImage/.asc not found"; exit 20; }
 
-          # Desktop entry
-          install -d /usr/share/applications
-          cat > /usr/share/applications/trezor-suite.desktop <<'EOF'
-          [Desktop Entry]
-          Name=Trezor Suite
-          Comment=Manage your Trezor hardware wallet
-          Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
-          Terminal=false
-          Type=Application
-          Categories=Finance;Utility;
-          EOF
+              curl -fsSLo trezor-suite.AppImage "\$APP_URL"
+              curl -fsSLo trezor-suite.AppImage.asc "\$ASC_URL"
+              chmod +x trezor-suite.AppImage
 
-          # udev rules come from trezor-common; ensure udev reload will succeed at runtime
-          # (udev will pick rules automatically on a running system)
-          %end
-          KS
+              gpg2 --batch --status-fd=1 --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
+                1> /tmp/gpg-status.log 2> /tmp/gpg-stderr.log || true
+              SIG_FPR=\$(awk '\''/^\[GNUPG:\] VALIDSIG /{print $3; exit}'\'' /tmp/gpg-status.log)
+              [ -n "\$SIG_FPR" ] && [ "\$SIG_FPR" = "\$TREZOR_FPR" ] || { echo "Signature fingerprint mismatch: \$SIG_FPR"; exit 21; }
 
-          # Inject runtime values
-          sed -i \
-            -e "s|@TREZOR_TAG@|${TREZOR_TAG}|g" \
-            -e "s|@TREZOR_KEY_URL@|${TREZOR_KEY_URL}|g" \
-            -e "s|@TREZOR_FPR@|${TREZOR_FPR}|g" \
-            trezor-overlay.ks
+              install -d /usr/share/applications
+              cat > /usr/share/applications/trezor-suite.desktop <<EOF
+              [Desktop Entry]
+              Name=Trezor Suite
+              Comment=Manage your Trezor hardware wallet
+              Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
+              Terminal=false
+              Type=Application
+              Categories=Finance;Utility;
+              EOF
+              %end
+              KS
 
-          # Optional: validate syntax
-          ksvalidator trezor-overlay.ks
+              # Flatten the kickstart (resolves all %include)
+              ksflatten -c trezor-overlay.ks -o trezor-flat.ks
 
-      - name: Flatten Kickstart (per docs) and build ISO with livecd-creator
-        run: |
-          set -euo pipefail
-          FEDORA_VER=$(cat FEDORA_VER.txt)
-          # Flatten any %include into a single ks as Quick Docs show
-          ksflatten -c trezor-overlay.ks -o trezor-flat.ks
+              # Build Live ISO (no-virt path as per Fedora docs)
+              OUT="${ISO_BASENAME}-F${FEDORA_VER}-x86_64.iso"
+              livemedia-creator \
+                --ks trezor-flat.ks \
+                --no-virt \
+                --resultdir /var/lmc \
+                --project Fedora-Trezor-Live \
+                --make-iso \
+                --volid "${ISO_LABEL}" \
+                --iso-only \
+                --iso-name "${OUT}" \
+                --releasever "${FEDORA_VER}" \
+                --macboot
 
-          # Build the ISO (this needs root; we're root in the Fedora container)
-          livecd-creator --verbose \
-            --config=trezor-flat.ks \
-            --fslabel="${ISO_LABEL}" \
-            --releasever="${FEDORA_VER}" \
-            --cache=/var/cache/live
-
-          # Find the resulting ISO and rename consistently
-          ISO="$(ls -1 *.iso | head -n1)"
-          test -n "$ISO"
-          OUT="${ISO_BASENAME}-F${FEDORA_VER}-x86_64.iso"
-          mv "$ISO" "$OUT"
-          sha256sum "$OUT" | tee "$OUT.sha256"
+              # Copy results back to workspace
+              cp -v /var/lmc/*.iso /workspace/ || :
+              cd /workspace
+              sha256sum "${OUT}" | tee "${OUT}.sha256"
+            '
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: trezor-fedora-iso-and-logs
+          name: trezor-fedora-iso
           path: |
             *.iso
             *.iso.sha256
             trezor-overlay.ks
             trezor-flat.ks
-            FEDORA_VER.txt
           retention-days: 14
