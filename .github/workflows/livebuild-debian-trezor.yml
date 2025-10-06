@@ -32,6 +32,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show runner & live-build versions (debug)
+        run: |
+          set -euo pipefail
+          uname -a || true
+          lsb_release -a || true
+          dpkg -l live-build || true
+          which lb || true
+
       - name: Install build tools
         run: |
           set -euo pipefail
@@ -84,8 +92,8 @@ jobs:
           Categories=Finance;Utility;
           EOF
 
-      # ---------- AUTHENTICATED, ROBUST ASSET DOWNLOAD ----------
-      - name: Fetch Trezor Suite assets (authenticated, asset API + retries)
+      # -------- Authenticated fetch from GitHub Releases (avoids 403) --------
+      - name: Fetch Trezor Suite assets (authenticated)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -104,68 +112,51 @@ jobs:
             -H "User-Agent: actions/${GITHUB_RUN_ID}" \
             "$API_URL" -o build-cache/release.json
 
-          # Extract asset IDs (not browser URLs)
           APP_ID=$(jq -r '.assets[] | select(.name|test("AppImage$")) | .id' build-cache/release.json | head -n1)
           ASC_ID=$(jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .id' build-cache/release.json | head -n1)
-          test -n "$APP_ID" && test -n "$ASC_ID" || { echo "AppImage/.asc not found in release"; jq -r '.assets[]?.name' build-cache/release.json; exit 1; }
+          test -n "$APP_ID" && test -n "$ASC_ID" || { echo "AppImage/.asc not found"; jq -r '.assets[]?.name' build-cache/release.json; exit 1; }
 
-          dl_asset () {
-            local ID="$1" OUT="$2"
-            local tries=5 delay=2
+          dl() {
+            local id="$1" out="$2" tries=6 delay=2
             for i in $(seq 1 $tries); do
-              echo "Attempt $i: downloading asset $ID -> $OUT"
-              # Use the release assets API with application/octet-stream
-              # Capture headers to inspect rate limiting if it fails
-              if curl -fsSLo "$OUT" \
-                   -D headers.txt \
+              echo "Attempt $i: asset $id -> $out"
+              if curl -fsSLo "$out" -D headers.txt \
                    -H "Authorization: Bearer ${GH_TOKEN}" \
                    -H "Accept: application/octet-stream" \
                    -H "X-GitHub-Api-Version: ${API_VER}" \
                    -H "User-Agent: actions/${GITHUB_RUN_ID}" \
-                   "https://api.github.com/repos/trezor/trezor-suite/releases/assets/${ID}"; then
-                rm -f headers.txt
-                return 0
+                   "https://api.github.com/repos/trezor/trezor-suite/releases/assets/${id}"; then
+                rm -f headers.txt; return 0
               fi
               status=$(awk 'toupper($1$2)=="HTTP/1.1"||toupper($1$2)=="HTTP/2"{print $3}' headers.txt | tail -n1 || true)
               remain=$(grep -i '^x-ratelimit-remaining:' headers.txt | awk '{print $2}' | tr -d '\r' || true)
-              reset=$(grep -i '^x-ratelimit-reset:' headers.txt | awk '{print $2}' | tr -d '\r' || true)
               retry_after=$(grep -i '^retry-after:' headers.txt | awk '{print $2}' | tr -d '\r' || true)
-              echo "HTTP: ${status:-unknown}  x-ratelimit-remaining: ${remain:-?}  reset: ${reset:-?}  retry-after: ${retry_after:-?}"
+              echo "HTTP: ${status:-?}  remaining: ${remain:-?}  retry-after: ${retry_after:-?}"
               rm -f headers.txt
-              if [[ "${status}" == "403" || "${status}" == "429" ]]; then
-                sleep "${retry_after:-$delay}"
-                delay=$((delay*2))
-              else
-                sleep "$delay"; delay=$((delay*2))
-              fi
+              sleep "${retry_after:-$delay}"; delay=$((delay*2))
             done
             return 1
           }
 
-          dl_asset "$APP_ID" build-cache/trezor-suite.AppImage
-          dl_asset "$ASC_ID" build-cache/trezor-suite.AppImage.asc
-
+          dl "$APP_ID" build-cache/trezor-suite.AppImage
+          dl "$ASC_ID" build-cache/trezor-suite.AppImage.asc
           file build-cache/trezor-suite.AppImage || true
           chmod +x build-cache/trezor-suite.AppImage
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
 
-      - name: Verify AppImage signature (pinned VALIDSIG)
+      - name: Verify AppImage signature (VALIDSIG must match pinned key)
         run: |
           set -euo pipefail
           curl -fsSL "${TREZOR_KEY_URL}" -o build-cache/trezor.asc
           gpg --batch --import build-cache/trezor.asc
-
           gpg --status-fd=1 --batch --verify \
               build-cache/trezor-suite.AppImage.asc build-cache/trezor-suite.AppImage \
               1> logs/gpg-status.log 2> logs/gpg-stderr.log || true
-
-          GOODSIG_COUNT=$(awk 'BEGIN{c=0} /^\[GNUPG:\] GOODSIG /{c++} END{print c}' logs/gpg-status.log)
+          GOODSIG=$(awk 'BEGIN{c=0} /^\[GNUPG:\] GOODSIG /{c++} END{print c}' logs/gpg-status.log)
           SIG_FPR=$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' logs/gpg-status.log)
-          echo "GOODSIG count: ${GOODSIG_COUNT:-0}"
+          echo "GOODSIG count: ${GOODSIG:-0}"
           echo "VALIDSIG fingerprint: ${SIG_FPR:-missing}"
-          if [[ "${GOODSIG_COUNT:-0}" -lt 1 || -z "$SIG_FPR" || "$SIG_FPR" != "$TREZOR_FPR" ]]; then
-            echo "Signature verification failed or fingerprint mismatch"; exit 5
-          fi
+          [[ "${GOODSIG:-0}" -ge 1 && -n "$SIG_FPR" && "$SIG_FPR" == "$TREZOR_FPR" ]] || { echo "Signature failed or fingerprint mismatch"; exit 5; }
           echo "Signature OK."
 
       - name: Hook (post-install in chroot)
@@ -178,16 +169,21 @@ jobs:
           EOF
           chmod +x config/hooks/normal/00-post-install.chroot
 
-      - name: Configure live-build (GRUB BIOS+UEFI, memtest off)
+      - name: Configure live-build (hybrid ISO, GRUB-EFI+Syslinux via LB_BOOTLOADERS)
+        env:
+          # Use the config variable instead of the CLI flag to avoid the '--bootloaders' error.
+          # This maps to the bootloaders setting across live-build versions.
+          LB_BOOTLOADERS: "syslinux,grub-efi"
         run: |
           set -euo pipefail
           sudo lb clean --purge || true
+          # Extra debug to show supported flags in your installed live-build
+          (lb config --help || true) | sed -n '1,120p'
           sudo lb config noauto \
             --mode debian \
             --architectures "${ARCH}" \
             --distribution "${SUITE}" \
             --binary-images iso-hybrid \
-            --bootloaders "grub-pc grub-efi" \
             --memtest none \
             --debian-installer false \
             --apt-secure true \
