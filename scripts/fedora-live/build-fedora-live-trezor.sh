@@ -14,9 +14,7 @@ dnf -y install lorax lorax-lmc-novirt pykickstart anaconda-tui \
                git jq curl gnupg2 ca-certificates xorriso
 
 FEDORA_VER="$(rpm -E %fedora)"
-REPO="https://download.fedoraproject.org/pub/fedora/linux/releases/${FEDORA_VER}/Everything/x86_64/os/"
 echo "==> Fedora detected: ${FEDORA_VER}"
-echo "==> Using repo: ${REPO}"
 
 echo "==> Cloning fedora-kickstarts"
 WORKDIR="$(mktemp -d)"
@@ -58,7 +56,6 @@ livemedia-creator \
   --iso-only \
   --iso-name "${OUT}" \
   --releasever "${FEDORA_VER}" \
-  --repo="${REPO}" \
   --macboot
 
 echo "==> Collecting ISO(s)"
