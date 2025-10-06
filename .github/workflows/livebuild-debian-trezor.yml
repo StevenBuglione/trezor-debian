@@ -8,25 +8,23 @@ on:
         required: false
         default: ""
   schedule:
-    - cron: "0 8 1 * *"   # monthly rebuild to pull Debian security updates + latest Suite
+    - cron: "0 8 1 * *"   # monthly rebuild
+
+permissions:
+  contents: read
 
 jobs:
   build-debian-live:
-    # IMPORTANT: run on the host VM (no container), so mount() in chroot works.
     runs-on: ubuntu-24.04
-
     defaults:
       run:
         shell: bash
-
     env:
       SUITE: bookworm
       ARCH: amd64
       ISO_BASENAME: debian-live-trezor
       ISO_LABEL: DEBIAN_bookworm_TREZOR
-      # SatoshiLabs 2021 Signing Key fingerprint (MUST match VALIDSIG)
       TREZOR_FPR: "EB483B26B078A4AA1B6F425EE21B6950A2ECB65C"
-      # Official sources
       TREZOR_KEY_URL: "https://trezor.io/security/satoshilabs-2021-signing-key.asc"
       TREZOR_UDEV_URL: "https://data.trezor.io/udev/51-trezor.rules"
 
@@ -34,7 +32,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prep APT & tools
+      - name: Install build tools
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -44,8 +42,6 @@ jobs:
             grub-pc-bin grub-efi-amd64-bin \
             ca-certificates curl wget jq gnupg udev \
             file libfuse2
-          lb --version || true
-          debootstrap --version || true
 
       - name: Prepare config tree
         run: |
@@ -62,12 +58,10 @@ jobs:
         run: |
           set -euo pipefail
           cat > config/package-lists/desktop.list.chroot <<'EOF'
-          # Lightweight desktop + basics
           task-xfce-desktop
           network-manager
           xorg
           policykit-1
-          # AppImage runtime & device helpers
           libfuse2
           usbutils
           udev
@@ -90,27 +84,72 @@ jobs:
           Categories=Finance;Utility;
           EOF
 
-      - name: Fetch Trezor Suite assets
-        id: suite
+      # ---------- AUTHENTICATED, ROBUST ASSET DOWNLOAD ----------
+      - name: Fetch Trezor Suite assets (authenticated, asset API + retries)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          mkdir -p build-cache
           TAG="${{ github.event.inputs.trezor_tag }}"
-          if [[ -n "$TAG" ]]; then
-            API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/${TAG}"
-          else
-            API="https://api.github.com/repos/trezor/trezor-suite/releases/latest"
-          fi
-          curl -fsSL "$API" -o build-cache/release.json
-          APP_URL=$(jq -r '.assets[] | select(.name|test("AppImage$")) | .browser_download_url' build-cache/release.json | head -n1)
-          ASC_URL=$(jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .browser_download_url' build-cache/release.json | head -n1)
-          if [[ -z "$APP_URL" || -z "$ASC_URL" ]]; then
-            echo "Could not locate AppImage or .asc in the release"; jq -r '.assets[]?.name' build-cache/release.json; exit 1
-          fi
-          curl -fsSL "$APP_URL" -o build-cache/trezor-suite.AppImage
-          curl -fsSL "$ASC_URL" -o build-cache/trezor-suite.AppImage.asc
-          file build-cache/trezor-suite.AppImage || true
+          API_VER="2022-11-28"
+          API_URL=${TAG:+https://api.github.com/repos/trezor/trezor-suite/releases/tags/${TAG}}
+          API_URL=${API_URL:-https://api.github.com/repos/trezor/trezor-suite/releases/latest}
 
-      - name: Import SatoshiLabs 2021 key & verify signature (fingerprint pinned)
+          echo "Querying release: $API_URL"
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: ${API_VER}" \
+            -H "User-Agent: actions/${GITHUB_RUN_ID}" \
+            "$API_URL" -o build-cache/release.json
+
+          # Extract asset IDs (not browser URLs)
+          APP_ID=$(jq -r '.assets[] | select(.name|test("AppImage$")) | .id' build-cache/release.json | head -n1)
+          ASC_ID=$(jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .id' build-cache/release.json | head -n1)
+          test -n "$APP_ID" && test -n "$ASC_ID" || { echo "AppImage/.asc not found in release"; jq -r '.assets[]?.name' build-cache/release.json; exit 1; }
+
+          dl_asset () {
+            local ID="$1" OUT="$2"
+            local tries=5 delay=2
+            for i in $(seq 1 $tries); do
+              echo "Attempt $i: downloading asset $ID -> $OUT"
+              # Use the release assets API with application/octet-stream
+              # Capture headers to inspect rate limiting if it fails
+              if curl -fsSLo "$OUT" \
+                   -D headers.txt \
+                   -H "Authorization: Bearer ${GH_TOKEN}" \
+                   -H "Accept: application/octet-stream" \
+                   -H "X-GitHub-Api-Version: ${API_VER}" \
+                   -H "User-Agent: actions/${GITHUB_RUN_ID}" \
+                   "https://api.github.com/repos/trezor/trezor-suite/releases/assets/${ID}"; then
+                rm -f headers.txt
+                return 0
+              fi
+              status=$(awk 'toupper($1$2)=="HTTP/1.1"||toupper($1$2)=="HTTP/2"{print $3}' headers.txt | tail -n1 || true)
+              remain=$(grep -i '^x-ratelimit-remaining:' headers.txt | awk '{print $2}' | tr -d '\r' || true)
+              reset=$(grep -i '^x-ratelimit-reset:' headers.txt | awk '{print $2}' | tr -d '\r' || true)
+              retry_after=$(grep -i '^retry-after:' headers.txt | awk '{print $2}' | tr -d '\r' || true)
+              echo "HTTP: ${status:-unknown}  x-ratelimit-remaining: ${remain:-?}  reset: ${reset:-?}  retry-after: ${retry_after:-?}"
+              rm -f headers.txt
+              if [[ "${status}" == "403" || "${status}" == "429" ]]; then
+                sleep "${retry_after:-$delay}"
+                delay=$((delay*2))
+              else
+                sleep "$delay"; delay=$((delay*2))
+              fi
+            done
+            return 1
+          }
+
+          dl_asset "$APP_ID" build-cache/trezor-suite.AppImage
+          dl_asset "$ASC_ID" build-cache/trezor-suite.AppImage.asc
+
+          file build-cache/trezor-suite.AppImage || true
+          chmod +x build-cache/trezor-suite.AppImage
+          cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
+
+      - name: Verify AppImage signature (pinned VALIDSIG)
         run: |
           set -euo pipefail
           curl -fsSL "${TREZOR_KEY_URL}" -o build-cache/trezor.asc
@@ -127,8 +166,7 @@ jobs:
           if [[ "${GOODSIG_COUNT:-0}" -lt 1 || -z "$SIG_FPR" || "$SIG_FPR" != "$TREZOR_FPR" ]]; then
             echo "Signature verification failed or fingerprint mismatch"; exit 5
           fi
-          chmod +x build-cache/trezor-suite.AppImage
-          cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
+          echo "Signature OK."
 
       - name: Hook (post-install in chroot)
         run: |
@@ -140,7 +178,7 @@ jobs:
           EOF
           chmod +x config/hooks/normal/00-post-install.chroot
 
-      - name: Configure live-build (GRUB for BIOS+UEFI, memtest off)
+      - name: Configure live-build (GRUB BIOS+UEFI, memtest off)
         run: |
           set -euo pipefail
           sudo lb clean --purge || true
