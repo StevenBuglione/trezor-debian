@@ -37,7 +37,6 @@ lxqt-config
 -transmission
 -epiphany
 -enki
--lximage-qt
 -konqueror
 -qupzilla
 %end
