@@ -77,9 +77,9 @@ fi
 # ----------------------------
 # App icon: install SVG into hicolor theme and update cache
 # ----------------------------
-if [ -f "${SRC_IMG_DIR}/trezor-suite.svg" ]; then
-  install -m0644 "${SRC_IMG_DIR}/trezor-suite.svg" \
-    "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps/trezor-suite.svg"
+if [ -f "${SRC_IMG_DIR}/trezor-suite.png" ]; then
+  install -m0644 "${SRC_IMG_DIR}/trezor-suite.png" \
+    "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps/trezor-suite.png"
 fi
 # (icon cache update is safe even if gtk utilities are minimal)
 chroot "${LIVE_ROOT}" bash -lc 'command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f /usr/share/icons/hicolor || true'
