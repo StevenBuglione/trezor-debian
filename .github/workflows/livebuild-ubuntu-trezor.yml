@@ -7,16 +7,21 @@ on:
 
 jobs:
   build-live-iso:
-    # Use a modern live-build from Debian to avoid Ubuntu's old syslinux theme logic
     runs-on: ubuntu-latest
+
+    # Use Debian's live-build in a container to avoid Ubuntu's legacy syslinux theme behavior
     container:
       image: debian:bookworm
+
+    # IMPORTANT: inside containers the default shell is `sh`. Force bash to avoid "Illegal option -o pipefail".
+    defaults:
+      run:
+        shell: bash
 
     env:
       CODENAME: noble
       ARCH: amd64
       ISO_NAME: ubuntu-live-trezor-${{ github.run_number }}.iso
-      # SatoshiLabs 2021 Signing Key fingerprint (must match VALIDSIG)
       TREZOR_FPR: "EB483B26B078A4AA1B6F425EE21B6950A2ECB65C"
 
     steps:
@@ -25,20 +30,18 @@ jobs:
 
       - name: Prep APT & tools
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
           apt-get install -y --no-install-recommends \
             live-build debootstrap xorriso squashfs-tools \
             dosfstools mtools grub-pc-bin grub-efi-amd64-bin \
             ca-certificates curl wget jq gnupg udev
-          # Helpful for AppImage execution inside the live system
-          # (libfuse2 for AppImage runtime compatibility)
           echo "libfuse2" > extra-pkgs.txt
 
       - name: Create project layout
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           rm -rf config logs build-cache auto
           mkdir -p config/includes.chroot/opt/trezor
           mkdir -p config/includes.chroot/usr/share/applications
@@ -49,8 +52,7 @@ jobs:
 
       - name: Add package list (base + helpers)
         run: |
-          set -euxo pipefail
-          # Core desktop & helpers for Suite to run nicely; keep it minimal
+          set -euo pipefail
           cat > config/package-lists/base.list.chroot <<'EOF'
           ubuntu-standard
           ubuntu-desktop-minimal
@@ -59,18 +61,14 @@ jobs:
           wget
           xxd
           udev
-          # AppImage runtime (needed for many AppImages on Ubuntu)
           libfuse2
-          # optional USB debugging tools
           usbutils
           EOF
-          # Append any extras
           cat extra-pkgs.txt >> config/package-lists/base.list.chroot || true
 
       - name: Add udev rules & desktop entry
         run: |
-          set -euxo pipefail
-          # Trezor udev rules (from upstream)
+          set -euo pipefail
           cat > config/includes.chroot/etc/udev/rules.d/51-trezor.rules <<'EOF'
           # Trezor devices
           SUBSYSTEMS=="usb", ATTRS{idVendor}=="1209", MODE="0660", GROUP="plugdev"
@@ -79,7 +77,6 @@ jobs:
           KERNEL=="hidraw*", ATTRS{idVendor}=="534c", MODE="0660", GROUP="plugdev"
           EOF
 
-          # Desktop launcher
           cat > config/includes.chroot/usr/share/applications/trezor-suite.desktop <<'EOF'
           [Desktop Entry]
           Name=Trezor Suite
@@ -92,65 +89,55 @@ jobs:
 
       - name: Fetch latest Trezor Suite + verify GPG
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           mkdir -p build-cache
           pushd build-cache
 
-          # 1) Query latest release assets from GitHub
+          # 1) Latest release assets
           rel_json="$(curl -fsSL https://api.github.com/repos/trezor/trezor-suite/releases/latest)"
-          # Find linux AppImage + .asc
           APP_URL="$(echo "$rel_json" | jq -r '.assets[] | select(.name|test("AppImage$")) | .browser_download_url' | head -n1)"
           ASC_URL="$(echo "$rel_json" | jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .browser_download_url' | head -n1)"
-
-          if [ -z "$APP_URL" ] || [ -z "$ASC_URL" ]; then
-            echo "Could not locate AppImage or signature from GitHub releases API"
-            exit 2
+          if [[ -z "$APP_URL" || -z "$ASC_URL" ]]; then
+            echo "Could not locate AppImage or .asc asset"; exit 2
           fi
 
           curl -fsSL "$APP_URL" -o trezor-suite.AppImage
           curl -fsSL "$ASC_URL" -o trezor-suite.AppImage.asc
 
-          # 2) Obtain SatoshiLabs 2021 Signing Key (multi-source, pinned FPR)
-          # Try keyservers first; fall back to publisher-hosted key if needed.
+          # 2) Import SatoshiLabs 2021 signing key (fingerprint pinned)
           set +e
           gpg --keyserver hkps://keys.openpgp.org --recv-keys "$TREZOR_FPR"
-          rc1=$?
-          if [ $rc1 -ne 0 ]; then
+          rc=$?
+          if [[ $rc -ne 0 ]]; then
             gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "$TREZOR_FPR" || true
           fi
           set -e
 
-          if ! gpg --list-keys "$TREZOR_FPR" > /dev/null 2>&1; then
-            # Fallback: fetch publisher key (still verify fingerprint!)
+          if ! gpg --list-keys "$TREZOR_FPR" >/dev/null 2>&1; then
             curl -fsSL https://trezor.io/security/satoshilabs-2021-signing-key.asc -o trezor.asc
             gpg --import trezor.asc
           fi
 
-          # 3) Verify signature & pin VALIDSIG fingerprint
+          # 3) Verify signature; ensure VALIDSIG matches pinned fingerprint
           gpg --status-fd=1 --batch --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
             | tee ../logs/gpg-status.log
-          # Extract VALIDSIG (field 2 or 3 depending on gpg)
           SIG_FPR="$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' ../logs/gpg-status.log)"
-          [ -z "$SIG_FPR" ] && SIG_FPR="$(awk '/^\[GNUPG:\] VALIDSIG /{print $2; exit}' ../logs/gpg-status.log || true)"
+          [[ -z "$SIG_FPR" ]] && SIG_FPR="$(awk '/^\[GNUPG:\] VALIDSIG /{print $2; exit}' ../logs/gpg-status.log || true)"
           echo "VALIDSIG fingerprint: ${SIG_FPR}" | tee -a ../logs/gpg-status.log
-
-          if [ "$SIG_FPR" != "$TREZOR_FPR" ]; then
-            echo "ERROR: Signature fingerprint mismatch (got $SIG_FPR, expected $TREZOR_FPR)"
-            exit 5
+          if [[ "$SIG_FPR" != "$TREZOR_FPR" ]]; then
+            echo "ERROR: Signature fingerprint mismatch (got $SIG_FPR, expected $TREZOR_FPR)"; exit 5
           fi
 
           chmod +x trezor-suite.AppImage
           popd
-
-          # Place AppImage in the live system
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
 
       - name: Write auto/config (GRUB-only, no memtest)
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           cat > auto/config <<'EOF'
-          #!/bin/sh
-          set -e
+          #!/bin/bash
+          set -euo pipefail
           lb config noauto \
             --mode ubuntu \
             --architectures amd64 \
@@ -172,68 +159,39 @@ jobs:
             --iso-application "Ubuntu Live (Trezor Suite)" \
             --iso-preparer "GitHub Actions" \
             --iso-publisher "YourOrg" \
-            --iso-volume "UBUNTU_${CODENAME}_TREZOR"
+            --iso-volume "UBUNTU_noble_TREZOR"
           EOF
           chmod +x auto/config
 
-      - name: (Optional) preseed minimal desktop defaults
+      - name: Optional post-install hook
         run: |
-          set -euxo pipefail
-          # Keep the image lean; you can add more hooks here as needed
+          set -euo pipefail
           cat > config/hooks/normal/00-post-install.chroot <<'EOF'
-          #!/bin/sh
-          set -euxo pipefail
-          # Make AppImage executable and visible to all users
+          #!/bin/bash
+          set -euo pipefail
           chmod +x /opt/trezor/trezor-suite.AppImage || true
-          # Ensure udev is reloaded at boot
           systemctl enable systemd-udevd.service || true
           EOF
           chmod +x config/hooks/normal/00-post-install.chroot
 
-      - name: Add debug helper script (runs pre/post build)
+      - name: Prebuild debug
         run: |
-          set -euxo pipefail
-          mkdir -p scripts
-          cat > scripts/debug.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -euxo pipefail
+          set -euo pipefail
           echo "===== Environment ====="
           uname -a || true
           cat /etc/os-release || true
           echo "===== live-build version ====="
           lb --version || true
-          which lb || true
-          echo "===== lb config print ====="
-          ( set +e; lb config --help >/dev/null 2>&1; echo "lb config ok=$?"; set -e )
           echo "===== tree: config ====="
           find config -maxdepth 3 -type f -print | sort || true
-          echo "===== APT sources (host) ====="
-          cat /etc/apt/sources.list || true
-          ls -l /etc/apt/sources.list.d || true
-          EOF
-          chmod +x scripts/debug.sh
-          ./scripts/debug.sh | tee logs/prebuild-debug.txt
 
       - name: Build ISO (GRUB-only)
         run: |
-          set -euxo pipefail
-          # Clean; then build with full logs
+          set -euo pipefail
           lb clean --purge || true
-          # Generate config tree
           ./auto/config
-          # Build (capture log)
           time lb build 2>logs/live-build-stderr.log | tee logs/live-build.log
-          # Move final ISO into root for artifact upload
-          mv binary.hybrid.iso "${ISO_NAME}" || mv binary.iso "${ISO_NAME}"
-
-      - name: Post-build diagnostics
-        if: always()
-        run: |
-          set -euxo pipefail
-          echo "===== Contents of binary dir ====="
-          ls -lah || true
-          echo "===== Log snippets ====="
-          tail -n +1 logs/*.log || true
+          mv binary.hybrid.iso "${ISO_NAME}" 2>/dev/null || mv binary.iso "${ISO_NAME}"
 
       - name: Upload artifacts
         if: always()
