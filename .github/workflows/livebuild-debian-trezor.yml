@@ -35,38 +35,54 @@ jobs:
           set -euo pipefail
           FED="${{ github.event.inputs.fedora_major }}"
           IMG="fedora:${FED:-latest}"
-          OUT_DIR=$PWD/out
+          OUT_DIR="$PWD/out"
           mkdir -p "$OUT_DIR"
 
+          # Pass env vars by name; docker will forward host values.
           docker run --rm --privileged \
             -v "$PWD":/workspace -w /workspace \
             -v /dev:/dev \
+            -e ISO_LABEL \
+            -e ISO_BASENAME \
+            -e TREZOR_FPR \
+            -e TREZOR_KEY_URL \
+            -e TREZOR_TAG="${{ github.event.inputs.trezor_tag }}" \
             "${IMG}" bash -lc '
               set -euo pipefail
 
-              dnf -y install lorax lorax-lmc-novirt pykickstart anaconda-tui git jq curl gnupg2 ca-certificates xorriso
+              # Safe defaults in case something wasn’t forwarded
+              : "${ISO_LABEL:=FEDORA_TREZOR}"
+              : "${ISO_BASENAME:=fedora-live-trezor}"
+              : "${TREZOR_FPR:=EB483B26B078A4AA1B6F425EE21B6950A2ECB65C}"
+              : "${TREZOR_KEY_URL:=https://trezor.io/security/satoshilabs-2021-signing-key.asc}"
+              : "${TREZOR_TAG:=}"
 
-              FEDORA_VER=$(rpm -E %fedora)
-              echo "Fedora detected: $FEDORA_VER"
+              dnf -y install lorax lorax-lmc-novirt pykickstart anaconda-tui \
+                             git jq curl gnupg2 ca-certificates xorriso
+
+              FEDORA_VER="$(rpm -E %fedora)"
+              echo "Fedora detected: ${FEDORA_VER}"
               REPO="https://download.fedoraproject.org/pub/fedora/linux/releases/${FEDORA_VER}/Everything/x86_64/os/"
 
               git clone --depth 1 https://pagure.io/fedora-kickstarts.git
               cd fedora-kickstarts
+              # Prefer release branch if it exists; otherwise use default branch
               REM="f${FEDORA_VER}"
               if git ls-remote --heads origin "$REM" | grep -q "$REM"; then
                 git fetch --depth=1 origin "refs/heads/${REM}:refs/heads/${REM}"
                 git switch "$REM"
               else
-                echo "Branch $REM not found; staying on default branch."
+                echo "Branch $REM not found; using $(git rev-parse --abbrev-ref HEAD)."
               fi
               KSDIR="$PWD"
               cd -
 
-              # Define OUT early so it is bound
+              # Name of the resulting ISO
               OUT="${ISO_BASENAME}-F${FEDORA_VER}-x86_64.iso"
 
+              # Write Kickstart template with placeholders
               cat > trezor-overlay.ks <<'KS'
-              %include ${KSDIR}/fedora-live-workstation.ks
+              %include __KSDIR__/fedora-live-workstation.ks
               
               %packages
               trezor-common
@@ -78,11 +94,12 @@ jobs:
               %end
               
               %post --log=/root/trezor-post.log
-              set -euo pipefail
+              # NOTE: keep this simple; we embed literal values below.
+              set -e
               
-              TREZOR_TAG="${TREZOR_TAG:-}"
-              TREZOR_KEY_URL="${TREZOR_KEY_URL}"
-              TREZOR_FPR="${TREZOR_FPR}"
+              TREZOR_TAG="__TREZOR_TAG__"
+              TREZOR_KEY_URL="__TREZOR_KEY_URL__"
+              TREZOR_FPR="__TREZOR_FPR__"
               
               mkdir -p /opt/trezor
               cd /opt/trezor
@@ -97,9 +114,9 @@ jobs:
               fi
               curl -fsSL "$REL_API" -o /tmp/release.json
               
-              APP_URL=$(jq -r ".assets[] | select(.name|test(\\"linux.*AppImage$\\") ) | .browser_download_url" /tmp/release.json | head -n1)
-              ASC_URL=$(jq -r ".assets[] | select(.name|test(\\"linux.*AppImage.asc$\\") ) | .browser_download_url" /tmp/release.json | head -n1)
-              [ -n "$APP_URL" ] && [ -n "$ASC_URL" ] || { echo "Trezor Suite AppImage or asc not found"; exit 20; }
+              APP_URL=$(jq -r ".assets[] | select(.name|test(\"linux.*AppImage$\")) | .browser_download_url" /tmp/release.json | head -n1)
+              ASC_URL=$(jq -r ".assets[] | select(.name|test(\"linux.*AppImage.asc$\")) | .browser_download_url" /tmp/release.json | head -n1)
+              [ -n "$APP_URL" ] && [ -n "$ASC_URL" ] || { echo "Trezor Suite AppImage or .asc not found"; exit 20; }
               
               curl -fsSLo trezor-suite.AppImage "$APP_URL"
               curl -fsSLo trezor-suite.AppImage.asc "$ASC_URL"
@@ -107,7 +124,7 @@ jobs:
               
               gpg2 --batch --status-fd=1 --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
                 1> /tmp/gpg-status.log 2> /tmp/gpg-stderr.log || true
-              SIG_FPR=$(awk "/^\[GNUPG:\] VALIDSIG /{print \$3; exit}" /tmp/gpg-status.log)
+              SIG_FPR=$(awk "/^\\[GNUPG:\\] VALIDSIG /{print \$3; exit}" /tmp/gpg-status.log)
               [ -n "$SIG_FPR" ] && [ "$SIG_FPR" = "$TREZOR_FPR" ] || { echo "Signature mismatch: $SIG_FPR"; exit 21; }
               
               install -d /usr/share/applications
@@ -120,15 +137,18 @@ jobs:
               Type=Application
               Categories=Finance;Utility;
               EOF
-              
               %end
               KS
 
-              # Replace placeholders with real values
+              # Inject real values/paths into the Kickstart
               sed -i \
-                -e "s|${KSDIR}/fedora-live-workstation.ks|${KSDIR}/fedora-live-workstation.ks|g" \
+                -e "s|__KSDIR__|${KSDIR}|g" \
+                -e "s|__TREZOR_TAG__|${TREZOR_TAG}|g" \
+                -e "s|__TREZOR_KEY_URL__|${TREZOR_KEY_URL}|g" \
+                -e "s|__TREZOR_FPR__|${TREZOR_FPR}|g" \
                 trezor-overlay.ks
 
+              # Flatten includes then build the ISO
               ksflatten -c trezor-overlay.ks -o trezor-flat.ks
 
               livemedia-creator \
@@ -141,7 +161,7 @@ jobs:
                 --iso-only \
                 --iso-name "${OUT}" \
                 --releasever "${FEDORA_VER}" \
-                --repo="$REPO" \
+                --repo="${REPO}" \
                 --macboot
 
               echo "Searching for generated ISO..."
