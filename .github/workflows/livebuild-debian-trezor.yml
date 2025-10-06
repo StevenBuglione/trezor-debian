@@ -15,7 +15,7 @@ on:
     - cron: "0 8 1 * *" # monthly
 
 permissions:
-  contents: read
+  contents: write   # needed to create releases & upload assets
 
 jobs:
   build:
@@ -34,6 +34,7 @@ jobs:
         run: mkdir -p out
 
       - name: Prefetch Trezor Suite (host-side) + signing key
+        id: trezor_prefetch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -49,9 +50,15 @@ jobs:
                       -H "Accept: application/vnd.github+json" \
                       "$URL" -o release.json
 
+          # Extract Trezor Suite version info
+          TREZOR_VERSION=$(jq -r '.tag_name // .name // .id' release.json)
+          if [ -z "${TREZOR_VERSION}" ] || [ "${TREZOR_VERSION}" = "null" ]; then
+            echo "Failed to extract Trezor Suite version" >&2
+            exit 1
+          fi
+
           APP_URL=$(jq -r '.assets[] | select(.name|test("linux.*(x86_64|amd64|x64).*AppImage$")) | .browser_download_url' release.json | head -n1)
           ASC_URL=$(jq -r '.assets[] | select(.name|test("linux.*(x86_64|amd64|x64).*AppImage.asc$")) | .browser_download_url' release.json | head -n1)
-
           if [ -z "${APP_URL}" ] || [ -z "${ASC_URL}" ]; then
             echo "Could not find AppImage assets in release:" >&2
             jq -r '.assets[]?.name' release.json || true
@@ -63,7 +70,7 @@ jobs:
           curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -L "$ASC_URL" -o scripts/fedora-live/vendor/trezor-suite.AppImage.asc
           chmod +x scripts/fedora-live/vendor/trezor-suite.AppImage
 
-          # Signing key (two mirrors; if both fail, we continue – the runtime launcher can still work)
+          # Signing key (best-effort)
           for U in \
             "https://trezor.io/security/satoshilabs-2021-signing-key.asc" \
             "https://data.trezor.io/security/satoshilabs-2021-signing-key.asc" \
@@ -84,12 +91,15 @@ jobs:
             echo "Host-side VALIDSIG: ${FPR:-<none>}"
           fi
 
+          echo "trezor_version=${TREZOR_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build inside Fedora container (privileged for loop devices)
+        env:
+          FED_INPUT: ${{ github.event.inputs.fedora_major }}
+          TREZOR_TAG_INPUT: ${{ github.event.inputs.trezor_tag }}
         run: |
           set -euo pipefail
-          FED="${{ github.event.inputs.fedora_major }}"
-          IMG="fedora:${FED:-latest}"
+          IMG="fedora:${FED_INPUT:-latest}"
 
           docker run --rm --privileged \
             -v "$PWD":/workspace -w /workspace \
@@ -98,15 +108,88 @@ jobs:
             -e ISO_BASENAME \
             -e TREZOR_FPR \
             -e TREZOR_KEY_URL \
-            -e TREZOR_TAG="${{ github.event.inputs.trezor_tag }}" \
+            -e TREZOR_TAG="${TREZOR_TAG_INPUT}" \
             "${IMG}" bash /workspace/scripts/fedora-live/build-fedora-live-trezor.sh
+
+      - name: Compute Checksums
+        run: |
+          set -euo pipefail
+          cd out
+          shopt -s nullglob
+          for f in *.iso; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -lh
+
+      - name: Derive Fedora version & arch (for release notes)
+        id: meta
+        env:
+          FED_INPUT: ${{ github.event.inputs.fedora_major }}
+        run: |
+          set -euo pipefail
+
+          # Arch from host is fine (build outputs x86_64 ISO)
+          ARCH="$(uname -m)"
+
+          # If user supplied a Fedora major, trust it; else query a short-lived Fedora container
+          if [ -n "${FED_INPUT}" ]; then
+            FEDORA_VERSION="${FED_INPUT}"
+          else
+            FEDORA_VERSION="$(docker run --rm fedora:latest bash -lc 'source /etc/os-release && echo ${VERSION_ID}')"
+          fi
+
+          # Sanity fallback
+          if [ -z "${FEDORA_VERSION}" ]; then FEDORA_VERSION="unknown"; fi
+
+          echo "arch=${ARCH}" >> "$GITHUB_OUTPUT"
+          echo "fedora_version=${FEDORA_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Show outputs
         run: ls -lh out || true
 
-      - name: Upload artifacts
+      - name: Upload artifacts (CI browsing convenience)
         uses: actions/upload-artifact@v4
         with:
           name: trezor-fedora-iso
           path: out
           retention-days: 14
+
+      # Create or update a GitHub Release and upload ISO + checksums
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.meta.outputs.fedora_version }}-trezor-${{ steps.trezor_prefetch.outputs.trezor_version }}-${{ github.run_number }}
+          name: Fedora ${{ steps.meta.outputs.fedora_version }} + Trezor Suite ${{ steps.trezor_prefetch.outputs.trezor_version }} (arch: ${{ steps.meta.outputs.arch }})
+          body: |
+            ## Fedora Live ISO with Trezor Suite
+
+            **Fedora Version:** ${{ steps.meta.outputs.fedora_version }}  
+            **Trezor Suite Version:** ${{ steps.trezor_prefetch.outputs.trezor_version }}  
+            **Architecture:** ${{ steps.meta.outputs.arch }}
+
+            ### What’s inside
+            - Fedora Live environment, pre-bundled with Trezor Suite AppImage
+            - Trezor signing key included for runtime verification
+            - Wayland/XWayland + LXQt desktop setup
+
+            ### How to use
+            1. Download the `.iso` and the corresponding `.sha256`.
+            2. Verify integrity:  
+               ```bash
+               sha256sum -c *.iso.sha256
+               ```
+            3. Flash the ISO to a USB (e.g., with `dd`, Fedora Media Writer, or Balena Etcher).
+            4. Boot the target machine from USB.
+
+            ### Notes
+            - If you entered only the **first 4 letters** of each BIP-39 word during recovery, Trezor Suite will auto-complete (BIP-39 rule).
+            - For long-term backups, full words are safest for cross-tool compatibility.
+
+            _Built automatically by CI on ${{ github.workflow }} run #${{ github.run_number }}._
+          draft: false
+          prerelease: false
+          files: |
+            out/*.iso
+            out/*.iso.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
