@@ -29,28 +29,25 @@ jobs:
       run:
         shell: bash
     env:
+      # Mirrors for live-build (Ubuntu)
       UBUNTU_MIRROR: "http://archive.ubuntu.com/ubuntu/"
       UBUNTU_SECURITY: "http://security.ubuntu.com/ubuntu/"
-      TAILORED_ISO_NAME: "ubuntu-live-trezor.iso"
 
-      # Trezor GitHub repo
+      # GitHub repo for trezor-suite
       GH_OWNER: "trezor"
       GH_REPO: "trezor-suite"
 
-      # Trezor signing key (KEYID + expected fingerprint)
-      TREZOR_SIGNING_KEYID: "86E0D76E6D53CAC6"
-      TREZOR_SIGNING_FPR:  "??PIN_THIS_FINGERPRINT??"
+      # Output ISO name
+      TAILORED_ISO_NAME: "ubuntu-live-trezor.iso"
 
-      # keys.openpgp.org HTTPS endpoints (we'll try fingerprint first, then keyid)
-      # (we fill the path dynamically below)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Runner info (and set debug trap)
+      - name: Runner info (debug trap enabled)
         run: |
           set -Eeuo pipefail
-          trap 'CODE=$?; echo "::group::DEBUG FAIL CONTEXT"; echo "Exit: $CODE"; echo "PWD: $(pwd)"; echo "Tree (top):"; find -maxdepth 3 -type d -printf "%p\n" || true; echo "config files:"; find config -type f -maxdepth 4 -print 2>/dev/null || true; echo "::endgroup::"; exit $CODE' ERR
+          trap 'CODE=$?; echo "::group::DEBUG FAIL CONTEXT"; echo "Exit: $CODE"; echo "PWD: $(pwd)"; echo "Tree (top):"; find -maxdepth 3 -type d -printf "%p\n" || true; echo "Files under config/: "; find config -type f -maxdepth 4 -print 2>/dev/null || true; echo "::endgroup::"; exit $CODE' ERR
           uname -a || true
           lsb_release -a || true
           df -h || true
@@ -94,7 +91,7 @@ jobs:
           mkdir -p config/hooks/normal
           mkdir -p logs
 
-      # ---- Write files independently (no heredoc nesting issues)
+      # ---- Write files in separate steps (avoid heredoc pitfalls) ----
       - name: Write package list (base.list.chroot)
         run: |
           set -euxo pipefail
@@ -156,15 +153,17 @@ jobs:
         run: |
           set -euxo pipefail
           echo "::group::base.list.chroot"; nl -ba config/package-lists/base.list.chroot; echo "::endgroup::"
-          echo "::group::udev"; nl -ba config/includes.chroot/etc/udev/rules.d/51-trezor.rules; echo "::endgroup::"
-          echo "::group::desktop"; nl -ba config/includes.chroot/usr/share/applications/trezor-suite.desktop; echo "::endgroup::"
+          echo "::group::udev 51-trezor.rules"; nl -ba config/includes.chroot/etc/udev/rules.d/51-trezor.rules; echo "::endgroup::"
+          echo "::group::desktop trezor-suite.desktop"; nl -ba config/includes.chroot/usr/share/applications/trezor-suite.desktop; echo "::endgroup::"
           if [[ "${{ steps.vars.outputs.DISABLE_NET }}" == "true" ]]; then
-            echo "::group::offline.conf"; nl -ba config/includes.chroot/etc/NetworkManager/conf.d/00-offline.conf; echo "::endgroup::"
+            echo "::group::NetworkManager default-off"; nl -ba config/includes.chroot/etc/NetworkManager/conf.d/00-offline.conf; echo "::endgroup::"
           fi
 
-      # ---- Fetch Trezor Suite from GitHub Releases (AppImage + .asc)
+      # ---- Discover AppImage + .asc from GitHub Releases (latest or tag) ----
       - name: Discover Trezor Suite release assets via GitHub API
         id: ghassets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
           owner="${GH_OWNER}"
@@ -176,8 +175,12 @@ jobs:
             api_url="https://api.github.com/repos/${owner}/${repo}/releases/latest"
           fi
 
-          curl -sSL "$api_url" -o release.json
-          echo "::group::Release metadata"; jq -r '.tag_name, .name, .assets[]?.name' release.json || true; echo "::endgroup::"
+          # Use auth header to avoid rate limits
+          curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" "$api_url" -o release.json
+
+          echo "::group::Release metadata"
+          jq -r '.tag_name, .name, (.assets[]?.name // empty)' release.json || true
+          echo "::endgroup::"
 
           appimage_url=$(jq -r '.assets[] | select(.name|test("AppImage$")) | .browser_download_url' release.json | head -n1)
           asc_url=$(jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .browser_download_url' release.json | head -n1)
@@ -190,7 +193,7 @@ jobs:
           echo "APPIMAGE_URL=$appimage_url" >> "$GITHUB_OUTPUT"
           echo "ASC_URL=$asc_url"         >> "$GITHUB_OUTPUT"
 
-      - name: Download AppImage + signature (from GitHub Releases)
+      - name: Download AppImage + signature (GitHub Releases)
         run: |
           set -euxo pipefail
           mkdir -p build-cache
@@ -198,38 +201,67 @@ jobs:
           curl -L "${{ steps.ghassets.outputs.ASC_URL }}"      -o build-cache/trezor-suite.AppImage.asc
           ls -lh build-cache/
 
-      # ---- Import Trezor public key over HTTPS (no keyserver)
-      - name: Import Trezor public key (HTTPS) and verify fingerprint
+      # ---- Import SatoshiLabs 2021 signing key from trezor.io over HTTPS (no keyservers) ----
+      - name: Import Trezor public key (HTTPS from trezor.io)
         run: |
           set -euxo pipefail
-          # Try fetching by FPR if provided, else by KEYID; both via HTTPS (no hkps)
-          fpr="${TREZOR_SIGNING_FPR}"
-          keyid="${TREZOR_SIGNING_KEYID}"
-
           mkdir -p build-cache/keys
-          # try fingerprint first if you have it pinned
-          if [[ "$fpr" != "??PIN_THIS_FINGERPRINT??" ]]; then
-            curl -fsSL "https://keys.openpgp.org/vks/v1/by-fingerprint/${fpr}" -o build-cache/keys/trezor.asc || true
-          fi
-          # fallback to keyid endpoint
+
+          # Primary URL (official domain). If they change the path, we try a couple of alternates for resilience.
+          urls=(
+            "https://trezor.io/security/satoshilabs-2021-signing-key.asc"
+            "https://trezor.io/security/satoshilabs-2021-signing-key.txt"
+            "https://trezor.io/security/satoshilabs-signing-key-2021.asc"
+          )
+
+          for u in "${urls[@]}"; do
+            if curl -fsSL "$u" -o build-cache/keys/trezor.asc; then
+              echo "Downloaded signing key from: $u"
+              break
+            fi
+          done
+
           if [[ ! -s build-cache/keys/trezor.asc ]]; then
-            curl -fsSL "https://keys.openpgp.org/vks/v1/by-keyid/0x${keyid}" -o build-cache/keys/trezor.asc
+            echo "Failed to download SatoshiLabs 2021 signing key from trezor.io"
+            exit 2
           fi
+
+          echo "::group::GPG show-keys (import candidate)"
+          gpg --show-keys --with-fingerprint build-cache/keys/trezor.asc || true
+          echo "::endgroup::"
 
           gpg --import build-cache/keys/trezor.asc
 
-          # If you know the exact fingerprint, enforce it (RECOMMENDED)
-          if [[ "$fpr" != "??PIN_THIS_FINGERPRINT??" ]]; then
-            IMPORTED=$(gpg --with-colons --fingerprint "0x${keyid}" | awk -F: '/^fpr:/ {print $10; exit}')
-            [[ "$IMPORTED" == "$fpr" ]] || { echo "Trezor key fingerprint mismatch: $IMPORTED (expected $fpr)"; exit 2; }
-          else
-            echo "WARNING: TREZOR_SIGNING_FPR not pinned. Set env TREZOR_SIGNING_FPR to the exact fingerprint for stronger security."
-          fi
-
-      - name: Verify AppImage signature
+      - name: Verify AppImage signature (issuer must equal imported key)
         run: |
           set -euxo pipefail
-          gpg --batch --verify build-cache/trezor-suite.AppImage.asc build-cache/trezor-suite.AppImage
+          # Extract the imported key's fingerprint (first fpr line)
+          IMPORTED_FPR="$(gpg --with-colons --fingerprint | awk -F: '/^fpr:/{print $10; exit}')"
+          if [ -z "$IMPORTED_FPR" ]; then
+            echo "No imported key fingerprint found"; exit 3
+          fi
+          echo "Imported Trezor key fingerprint: $IMPORTED_FPR"
+
+          # Verify signature and capture machine-readable status
+          gpg --status-fd=1 --batch --verify \
+            build-cache/trezor-suite.AppImage.asc build-cache/trezor-suite.AppImage \
+            2> >(tee logs/gpg-stderr.log >&2) \
+            | tee logs/gpg-status.log
+
+          SIG_GOOD="$(awk '/^\[GNUPG:\] GOODSIG /{c++} END{print c+0}' logs/gpg-status.log)"
+          SIG_FPR="$(awk '/^\[GNUPG:\] VALIDSIG /{print $10; exit}' logs/gpg-status.log || true)"
+
+          if [ "$SIG_GOOD" -lt 1 ] || [ -z "$SIG_FPR" ]; then
+            echo "Signature not good or missing VALIDSIG line"; exit 4
+          fi
+
+          echo "Signature VALIDSIG fingerprint: $SIG_FPR"
+
+          # Enforce issuer == imported key (ties trust to trezor.io key over HTTPS)
+          if [ "$SIG_FPR" != "$IMPORTED_FPR" ]; then
+            echo "Mismatch: signature issuer ($SIG_FPR) != imported key ($IMPORTED_FPR)"; exit 5
+          fi
+
           chmod +x build-cache/trezor-suite.AppImage
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
           echo "::group::Verify AppImage presence"; ls -l config/includes.chroot/opt/trezor/; echo "::endgroup::"
@@ -256,7 +288,7 @@ jobs:
             --iso-application "Ubuntu Live (Trezor Suite)" \
             --iso-volume "${{ steps.vars.outputs.VOL }}" \
             --checksums "sha256"
-          echo "::group::lb config show"; ls -la config || true; echo "::endgroup::"
+          echo "::group::lb config dir"; ls -la config || true; echo "::endgroup::"
 
       - name: Build ISO (verbose)
         run: |
