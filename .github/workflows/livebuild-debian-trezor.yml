@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
   schedule:
-    - cron: "0 8 1 * *"   # monthly rebuild
+    - cron: "0 8 1 * *"
 
 permissions:
   contents: read
@@ -19,13 +19,12 @@ jobs:
     defaults:
       run:
         shell: bash
-
     env:
       SUITE: bookworm
       ARCH: amd64
       ISO_BASENAME: debian-live-trezor
       ISO_LABEL: DEBIAN_bookworm_TREZOR
-      TREZOR_FPR: "EB483B26B078A4AA1B6F425EE21B6950A2ECB65C"   # SatoshiLabs 2021 key
+      TREZOR_FPR: "EB483B26B078A4AA1B6F425EE21B6950A2ECB65C"   # SatoshiLabs 2021 key (VALIDSIG must match)
       TREZOR_KEY_URL: "https://trezor.io/security/satoshilabs-2021-signing-key.asc"
       TREZOR_UDEV_URL: "https://data.trezor.io/udev/51-trezor.rules"
 
@@ -44,6 +43,19 @@ jobs:
             syslinux-common isolinux \
             ca-certificates curl wget jq file libfuse2 \
             gnupg dirmngr gpg-agent udev
+
+      # --- Patch live-build so it fetches the correct Contents path (…/main/Contents-*.gz) ---
+      - name: Patch live-build Contents URL (prevents 404)
+        run: |
+          set -euo pipefail
+          f=/usr/lib/live/build/lb_chroot_linux-image
+          sudo grep -n 'Contents-${LB_ARCHITECTURES}\.gz' "$f" || true
+          # Insert '/main' before Contents-*.gz; match literal ${...} by escaping '$'
+          sudo sed -i \
+            's#dists/\${LB_PARENT_DISTRIBUTION}/Contents-\${LB_ARCHITECTURES}\.gz#dists/${LB_PARENT_DISTRIBUTION}/main/Contents-${LB_ARCHITECTURES}.gz#g' \
+            "$f"
+          echo "--- after patch ---"
+          sudo grep -n 'Contents-${LB_ARCHITECTURES}\.gz' "$f" || true
 
       - name: Prepare config tree
         run: |
@@ -87,7 +99,7 @@ jobs:
           Categories=Finance;Utility;
           EOF
 
-      # --- Authenticated GitHub Release Assets download (avoids 403) ---
+      # --- Authenticated GitHub Release Assets download (avoids 403/rate-limit) ---
       - name: Fetch Trezor Suite assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -134,7 +146,6 @@ jobs:
 
           dl "$APP_ID" build-cache/trezor-suite.AppImage
           dl "$ASC_ID" build-cache/trezor-suite.AppImage.asc
-
           file build-cache/trezor-suite.AppImage || true
           chmod +x build-cache/trezor-suite.AppImage
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
@@ -157,9 +168,10 @@ jobs:
           [[ "${GOODSIG:-0}" -ge 1 && -n "$SIG_FPR" && "$SIG_FPR" == "$TREZOR_FPR" ]] || {
             echo "Signature failed or fingerprint mismatch"; exit 5; }
 
-      - name: Post-install hook (AppImage perms) + APT security sanitizer
+      - name: Post-install hook + security sources sanitizer
         run: |
           set -euo pipefail
+          # Make AppImage executable in the live system
           cat > config/hooks/normal/00-post-install.chroot <<'EOF'
           #!/bin/bash
           set -euo pipefail
@@ -167,7 +179,7 @@ jobs:
           EOF
           chmod +x config/hooks/normal/00-post-install.chroot
 
-          # Fix any accidental 'bookworm/updates' to 'bookworm-security' inside the image.
+          # Fix any accidental 'bookworm/updates' to 'bookworm-security' inside the chroot
           cat > config/hooks/normal/05-fix-security-sources.chroot <<'EOF'
           #!/bin/bash
           set -euo pipefail
@@ -178,7 +190,7 @@ jobs:
           EOF
           chmod +x config/hooks/normal/05-fix-security-sources.chroot
 
-      # --- create security list BEFORE lb config (avoid root-owned config issues) ---
+      # Keep defaults for main/updates; only add the security entry to avoid duplicate warnings
       - name: Add debian-security list (no duplicates)
         run: |
           set -euo pipefail
@@ -188,7 +200,7 @@ jobs:
           EOF
           cp config/archives/01security.list.chroot config/archives/01security.list.binary
 
-      - name: Configure live-build (user-owned config; no sudo)
+      - name: Configure live-build (no duplicate trailing slashes)
         run: |
           set -euo pipefail
           lb clean --purge || true
@@ -202,9 +214,9 @@ jobs:
             --apt-secure true \
             --apt-recommends true \
             --archive-areas "main contrib non-free-firmware" \
-            --mirror-bootstrap "http://deb.debian.org/debian/" \
-            --mirror-chroot    "http://deb.debian.org/debian/" \
-            --mirror-binary    "http://deb.debian.org/debian/" \
+            --mirror-bootstrap "http://deb.debian.org/debian" \
+            --mirror-chroot    "http://deb.debian.org/debian" \
+            --mirror-binary    "http://deb.debian.org/debian" \
             --mirror-chroot-security "http://deb.debian.org/debian-security" \
             --mirror-binary-security "http://deb.debian.org/debian-security" \
             --security false \
@@ -214,9 +226,6 @@ jobs:
             --iso-publisher "YourOrg" \
             --iso-volume "${ISO_LABEL}" \
             --checksums sha256
-
-      # If you ever need to write into a root-owned config/, use sudo tee:
-      #   echo "deb http://... bookworm-security main" | sudo tee config/archives/01security.list.chroot >/dev/null
 
       - name: Build ISO (verbose)
         run: |
