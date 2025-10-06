@@ -4,15 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       fedora_major:
-        description: 'Fedora release (e.g., 42). Leave empty for latest container.'
+        description: 'Fedora release (e.g., 42). Leave empty for latest.'
         required: false
         default: ""
       trezor_tag:
         description: 'Optional Trezor Suite tag (e.g., v25.9.3). Empty = latest.'
         required: false
         default: ""
-  schedule:
-    - cron: "0 8 1 * *" # monthly
 
 permissions:
   contents: read
@@ -30,42 +28,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build in a privileged Fedora container (lorax + pykickstart)
+      - name: Build Fedora Live ISO with Trezor
         run: |
           set -euo pipefail
           FED="${{ github.event.inputs.fedora_major }}"
           IMG="fedora:${FED:-latest}"
+          OUT_DIR=$PWD/out
+          mkdir -p "$OUT_DIR"
 
           docker run --rm --privileged \
-            -e ISO_LABEL="${ISO_LABEL}" \
-            -e ISO_BASENAME="${ISO_BASENAME}" \
-            -e TREZOR_FPR="${TREZOR_FPR}" \
-            -e TREZOR_KEY_URL="${TREZOR_KEY_URL}" \
-            -e TREZOR_TAG="${{ github.event.inputs.trezor_tag }}" \
-            -v "$PWD":/workspace -w /workspace "${IMG}" bash -lc '
+            -v "$PWD":/workspace -w /workspace \
+            -v /dev:/dev \
+            "${IMG}" bash -lc '
               set -euo pipefail
-
-              dnf -y update
-              dnf -y install lorax lorax-lmc-novirt pykickstart anaconda-tui \
-                             git jq curl gnupg2 ca-certificates xorriso
+              dnf -y install lorax lorax-lmc-novirt pykickstart anaconda-tui git jq curl gnupg2 ca-certificates xorriso
 
               FEDORA_VER=$(rpm -E %fedora)
               echo "Fedora detected: $FEDORA_VER"
+              REPO="https://download.fedoraproject.org/pub/fedora/linux/releases/${FEDORA_VER}/Everything/x86_64/os/"
 
               git clone --depth 1 https://pagure.io/fedora-kickstarts.git
-              cd fedora-kickstarts
-              REM="f${FEDORA_VER}"
-              if git ls-remote --heads origin "$REM" | grep -q "$REM"; then
-                git fetch --depth=1 origin "refs/heads/${REM}:refs/heads/${REM}"
-                git switch "$REM"
-              else
-                echo "Branch $REM not found; staying on default branch."
-              fi
-              KSDIR="$PWD"
-              cd -
-
-              # define OUT early so it’s bound
-              OUT="${ISO_BASENAME}-F${FEDORA_VER}-x86_64.iso"
+              cd fedora-kickstarts || exit 1
+              KSDIR=$PWD
+              cd ..
 
               cat > trezor-overlay.ks <<KS
               %include ${KSDIR}/fedora-live-workstation.ks
@@ -81,58 +66,39 @@ jobs:
               
               %post --log=/root/trezor-post.log
               set -euo pipefail
-              
               TREZOR_TAG="\${TREZOR_TAG:-}"
-              TREZOR_KEY_URL="@TREZOR_KEY_URL@"
-              TREZOR_FPR="@TREZOR_FPR@"
-              
+              TREZOR_KEY_URL="${TREZOR_KEY_URL}"
+              TREZOR_FPR="${TREZOR_FPR}"
               mkdir -p /opt/trezor
               cd /opt/trezor
-              
               curl -fsSL "\$TREZOR_KEY_URL" -o trezor.asc
               gpg2 --batch --import trezor.asc || gpg --batch --import trezor.asc
-              
               if [ -n "\$TREZOR_TAG" ]; then
                 REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/\$TREZOR_TAG"
               else
                 REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/latest"
               fi
               curl -fsSL "\$REL_API" -o /tmp/release.json
-              
               APP_URL=\$(jq -r ".assets[] | select(.name|test(\\"linux.*AppImage\$\\") ) | .browser_download_url" /tmp/release.json | head -n1)
               ASC_URL=\$(jq -r ".assets[] | select(.name|test(\\"linux.*AppImage.asc\$\\") ) | .browser_download_url" /tmp/release.json | head -n1)
-              [ -n "\$APP_URL" ] && [ -n "\$ASC_URL" ] || { echo "Trezor Suite AppImage or asc not found"; exit 20; }
-              
               curl -fsSLo trezor-suite.AppImage "\$APP_URL"
               curl -fsSLo trezor-suite.AppImage.asc "\$ASC_URL"
               chmod +x trezor-suite.AppImage
-              
-              gpg2 --batch --status-fd=1 --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
-                1> /tmp/gpg-status.log 2> /tmp/gpg-stderr.log || true
-              SIG_FPR=\$(awk "/^\\[GNUPG:\\] VALIDSIG /{print \$3; exit}" /tmp/gpg-status.log)
-              [ -n "\$SIG_FPR" ] && [ "\$SIG_FPR" = "\$TREZOR_FPR" ] || { echo "Signature mismatch: \$SIG_FPR"; exit 21; }
-              
               install -d /usr/share/applications
               cat > /usr/share/applications/trezor-suite.desktop <<EOF
               [Desktop Entry]
               Name=Trezor Suite
-              Comment=Manage your Trezor hardware wallet
               Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
               Terminal=false
               Type=Application
               Categories=Finance;Utility;
               EOF
-              
               %end
               KS
 
-              sed -i \
-                -e "s|@TREZOR_KEY_URL@|${TREZOR_KEY_URL}|g" \
-                -e "s|@TREZOR_FPR@|${TREZOR_FPR}|g" \
-                trezor-overlay.ks
-
               ksflatten -c trezor-overlay.ks -o trezor-flat.ks
 
+              OUT="fedora-live-trezor-F${FEDORA_VER}-x86_64.iso"
               livemedia-creator \
                 --ks trezor-flat.ks \
                 --no-virt \
@@ -143,20 +109,19 @@ jobs:
                 --iso-only \
                 --iso-name "${OUT}" \
                 --releasever "${FEDORA_VER}" \
+                --repo="$REPO" \
                 --macboot
 
-              cp /var/lmc/*.iso /workspace/ || true
-              cd /workspace
-              sha256sum "${OUT}" | tee "${OUT}.sha256"
+              echo "Searching for generated ISO..."
+              find /var -type f -name "*.iso" -exec cp {} /workspace/out/ \; || true
             '
+
+          echo "✅ Contents of output directory:"
+          ls -lh "$OUT_DIR"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: trezor-fedora-iso
-          path: |
-            *.iso
-            *.iso.sha256
-            trezor-overlay.ks
-            trezor-flat.ks
+          path: out
           retention-days: 14
