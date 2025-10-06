@@ -38,13 +38,11 @@ lxqt-config
 -epiphany
 -enki
 -lximage-qt
-
 -konqueror
 -qupzilla
-# (You can add more -pkgs here as you discover them)
 %end
 
-# Host-side post: copy artifacts, bundle scripts, set themes/wallpaper (no network)
+# Host-side post: copy artifacts, bundle scripts, set themes/wallpaper/icon (no network)
 %post --nochroot --log=/root/trezor-post.log
 set -euo pipefail
 
@@ -61,7 +59,8 @@ install -d -m0755 "${LIVE_ROOT}/opt/trezor" \
                    "${LIVE_ROOT}/usr/local/bin" \
                    "${LIVE_ROOT}/etc/xdg/autostart" \
                    "${LIVE_ROOT}/etc/xdg/lxqt" \
-                   "${LIVE_ROOT}/usr/share/backgrounds/trezor"
+                   "${LIVE_ROOT}/usr/share/backgrounds/trezor" \
+                   "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps"
 
 # If prefetched on the host, vendor them in (optional)
 [ -f "${SRC_VENDOR}/trezor-suite.AppImage" ]     && install -m0755 "${SRC_VENDOR}/trezor-suite.AppImage"     "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage"     || true
@@ -75,6 +74,16 @@ if [ -d "${SRC_SCRIPTS}" ]; then
   find "${LIVE_ROOT}/opt/trezor-scripts" -type f -name "*.sh" -exec chmod 0755 {} \;
 fi
 
+# ----------------------------
+# App icon: install SVG into hicolor theme and update cache
+# ----------------------------
+if [ -f "${SRC_IMG_DIR}/trezor-suite.svg" ]; then
+  install -m0644 "${SRC_IMG_DIR}/trezor-suite.svg" \
+    "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps/trezor-suite.svg"
+fi
+# (icon cache update is safe even if gtk utilities are minimal)
+chroot "${LIVE_ROOT}" bash -lc 'command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f /usr/share/icons/hicolor || true'
+
 # Desktop launcher for Trezor Suite (assumes AppImage is embedded by CI)
 if [ -x "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage" ]; then
   cat > "${LIVE_ROOT}/usr/share/applications/trezor-suite.desktop" <<'EOF'
@@ -82,6 +91,7 @@ if [ -x "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage" ]; then
 Name=Trezor Suite
 Comment=Manage your Trezor hardware wallet
 Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
+Icon=trezor-suite
 Terminal=false
 Type=Application
 Categories=Finance;Utility;
@@ -97,8 +107,6 @@ if [ -d "${SRC_THEME}" ]; then
 fi
 
 # 2) System-wide LXQt defaults
-#    - Icon theme: Breeze Dark
-#    - LXQt theme: Arch-Colors (falls back to default if not installed)
 cat > "${LIVE_ROOT}/etc/xdg/lxqt/lxqt.conf" <<'EOF'
 [General]
 icon_theme=Breeze Dark
@@ -108,7 +116,6 @@ EOF
 # ----------------------------
 # Wallpaper: use repository image
 # ----------------------------
-# Copy first supported image from /workspace/images to system backgrounds
 wall=""
 for n in background.png background.jpg wallpaper.png wallpaper.jpg trezor.png trezor.jpg; do
   if [ -f "${SRC_IMG_DIR}/${n}" ]; then
@@ -129,8 +136,8 @@ EOF
 fi
 
 # ----------------------------
-# Optional hardening: disable obvious network-y services that the spin may pull
-# (We keep this conservative to avoid breaking the session; expand if you want fully offline.)
+# Optional hardening: quiet down network-y services the spin may pull
+# ----------------------------
 for s in NetworkManager-wait-online avahi-daemon cups ModemManager sshd ; do
   chroot "${LIVE_ROOT}" systemctl disable --now "$s" 2>/dev/null || true
   chroot "${LIVE_ROOT}" systemctl mask "$s" 2>/dev/null || true
