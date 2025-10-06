@@ -10,7 +10,7 @@ ca-certificates
 %end
 
 # Copy pre-fetched bits from the workspace into the image and always create a launcher.
-# No network needed here.
+# No network needed during compose.
 %post --nochroot --log=/root/trezor-post.log
 set -euo pipefail
 
@@ -33,24 +33,36 @@ if [ -f "${SRC}/trezor.asc" ]; then
   install -m0644 "${SRC}/trezor.asc" "${LIVE_ROOT}/opt/trezor/trezor.asc"
 fi
 
-# First-run helper: if AppImage is missing, fetch latest from GitHub at launch.
+# First-run helper: if AppImage is missing, fetch latest for the correct arch at launch.
 cat > "${LIVE_ROOT}/usr/local/bin/trezor-suite" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
+
 APP="/opt/trezor/trezor-suite.AppImage"
+
 if [ ! -x "$APP" ]; then
-  echo "Trezor Suite not found. Fetching latest AppImage..."
-  TMP="$(mktemp -d)"
+  ARCH="$(uname -m)"
+  case "$ARCH" in
+    x86_64|amd64) RX='linux.*(x86_64|amd64|x64).*AppImage$' ;;
+    aarch64|arm64) RX='linux.*(aarch64|arm64).*AppImage$' ;;
+    armv7l|armv7|armhf) RX='linux.*(armv7|armhf).*AppImage$' ;;
+    *) RX='AppImage$' ;;
+  esac
+
+  echo "Trezor Suite not found. Fetching latest AppImage for $ARCH …"
   URL="$(curl -fsSL https://api.github.com/repos/trezor/trezor-suite/releases/latest \
-        | jq -r '.assets[] | select(.name|test("linux.*AppImage$")) | .browser_download_url' | head -n1)"
+        | jq -r --arg rx "$RX" '.assets[] | select(.name|test($rx)) | .browser_download_url' | head -n1)"
   if [ -z "$URL" ]; then
-    echo "Could not determine latest AppImage URL from GitHub." >&2
+    echo "Could not determine latest AppImage URL for $ARCH." >&2
     exit 1
   fi
-  curl -fsSL -L "$URL" -o "$TMP/trezor.AppImage"
-  chmod +x "$TMP/trezor.AppImage"
-  sudo install -m0755 "$TMP/trezor.AppImage" "$APP"
+
+  TMP="$(mktemp)"
+  curl -fsSL -L "$URL" -o "$TMP"
+  sudo install -m0755 "$TMP" "$APP"
+  rm -f "$TMP"
 fi
+
 exec "$APP" --no-sandbox "$@"
 EOS
 chmod +x "${LIVE_ROOT}/usr/local/bin/trezor-suite"
