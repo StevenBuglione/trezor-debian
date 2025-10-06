@@ -33,6 +33,57 @@ jobs:
       - name: Prepare output dir
         run: mkdir -p out
 
+      - name: Prefetch Trezor Suite (host-side) + signing key
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p scripts/fedora-live/vendor
+          TAG="${{ github.event.inputs.trezor_tag }}"
+          API="https://api.github.com/repos/trezor/trezor-suite/releases"
+          URL="${API}/latest"
+          if [ -n "${TAG}" ]; then URL="${API}/tags/${TAG}"; fi
+
+          # Fetch release JSON with auth to avoid rate-limits
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                      -H "Accept: application/vnd.github+json" \
+                      "$URL" -o release.json
+
+          APP_URL=$(jq -r '.assets[] | select(.name|test("AppImage$")) | .browser_download_url' release.json | head -n1)
+          ASC_URL=$(jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .browser_download_url' release.json | head -n1)
+          if [ -z "${APP_URL}" ] || [ -z "${ASC_URL}" ]; then
+            echo "Could not find AppImage assets in release:" >&2
+            jq -r '.assets[]?.name' release.json || true
+            exit 20
+          fi
+
+          # Download assets with auth header following redirects
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -L "$APP_URL" -o scripts/fedora-live/vendor/trezor-suite.AppImage
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -L "$ASC_URL" -o scripts/fedora-live/vendor/trezor-suite.AppImage.asc
+          chmod +x scripts/fedora-live/vendor/trezor-suite.AppImage
+
+          # Signing key (two mirrors; if both fail, we continue – the runtime launcher can still work)
+          for U in \
+            "https://trezor.io/security/satoshilabs-2021-signing-key.asc" \
+            "https://data.trezor.io/security/satoshilabs-2021-signing-key.asc" \
+          ; do
+            if curl -fsSL "$U" -o scripts/fedora-live/vendor/trezor.asc; then
+              break
+            fi
+          done
+
+          # Optional host-side verification (best-effort)
+          if command -v gpg >/dev/null 2>&1 && [ -s scripts/fedora-live/vendor/trezor.asc ]; then
+            GNUPGHOME="$(mktemp -d)"
+            export GNUPGHOME
+            gpg --batch --import scripts/fedora-live/vendor/trezor.asc || true
+            gpg --batch --status-fd=1 --verify scripts/fedora-live/vendor/trezor-suite.AppImage.asc scripts/fedora-live/vendor/trezor-suite.AppImage \
+              1> gpg-status.log 2> gpg-stderr.log || true
+            FPR=$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' gpg-status.log || true)
+            echo "Host-side VALIDSIG: ${FPR:-<none>}"
+          fi
+
+
       - name: Build inside Fedora container (privileged for loop devices)
         run: |
           set -euo pipefail
