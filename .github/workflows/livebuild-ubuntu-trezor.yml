@@ -1,0 +1,347 @@
+name: Live-Build Ubuntu + Trezor Suite ISO
+
+on:
+  schedule:
+    - cron: "0 9 1 * *" # monthly, 09:00 UTC on the 1st
+  workflow_dispatch:
+    inputs:
+      ubuntu_codename:
+        description: "Ubuntu codename (jammy=22.04 LTS, noble=24.04 LTS)"
+        default: "jammy"
+        required: true
+      disable_network_by_default:
+        description: "Disable NetworkManager by default in the live session"
+        type: boolean
+        default: false
+
+jobs:
+  # ----------------------------
+  # 1) Primary: build via live-build
+  # ----------------------------
+  live_build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      # Mirrors (you can point to your regional mirror if you want)
+      UBUNTU_MIRROR: "http://archive.ubuntu.com/ubuntu/"
+      UBUNTU_SECURITY: "http://security.ubuntu.com/ubuntu/"
+      # Keys to pin
+      TREZOR_SIGNING_KEYID: "0x86E0D76E6D53CAC6"
+      TAILORED_ISO_NAME: "ubuntu-live-trezor.iso"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            live-build debootstrap cdebootstrap \
+            xorriso squashfs-tools genisoimage \
+            dosfstools syslinux-utils isolinux \
+            gpg wget curl rsync ca-certificates \
+            ubuntu-keyring ubuntu-archive-keyring
+
+      - name: Resolve inputs
+        id: vars
+        run: |
+          echo "CODENAME=${{ github.event.inputs.ubuntu_codename || 'jammy' }}" >> $GITHUB_OUTPUT
+          echo "DISABLE_NET=${{ github.event.inputs.disable_network_by_default == 'true' && 'true' || 'false' }}" >> $GITHUB_OUTPUT
+          # human-friendly label
+          echo "VOL=UBUNTU_${{ github.event.inputs.ubuntu_codename || 'jammy' }}_TREZOR" >> $GITHUB_OUTPUT
+
+      - name: Prepare live-build config
+        run: |
+          set -euxo pipefail
+
+          # Clean any previous state
+          sudo lb clean || true
+          rm -rf config
+          mkdir -p config/includes.chroot/opt/trezor
+          mkdir -p config/includes.chroot/usr/share/applications
+          mkdir -p config/includes.chroot/etc/udev/rules.d
+          mkdir -p config/package-lists
+          mkdir -p config/hooks/normal
+
+          # ---- Package list (ensure AppImage support + desktop basics)
+          cat > config/package-lists/base.list.chroot <<'EOF'
+          # Minimal desktop bits so AppImage can run and NetworkManager is available
+          ubuntu-standard
+          casper
+          linux-generic
+          network-manager
+          xorg
+          xserver-xorg
+          libfuse2
+          # optional niceties
+          xdg-utils
+          gvfs
+          # udev is already part of base, but keep here for clarity
+          udev
+          EOF
+
+          # ---- udev rules to allow Trezor access in live session
+          cat > config/includes.chroot/etc/udev/rules.d/51-trezor.rules <<'EOF'
+          # Trezor (usb/hidraw) – permissive for ephemeral live session
+          SUBSYSTEM=="hidraw", ATTRS{idVendor}=="534c", MODE="0666"
+          SUBSYSTEM=="usb", ATTR{idVendor}=="534c", MODE="0666"
+          EOF
+
+          # ---- Desktop launcher
+          cat > config/includes.chroot/usr/share/applications/trezor-suite.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Trezor Suite
+          Exec=/opt/trezor/trezor-suite.AppImage
+          Icon=utilities-terminal
+          Type=Application
+          Categories=Finance;Utility;
+          Terminal=false
+          EOF
+
+          # ---- Optional: disable NetworkManager by default
+          if [ "${{ steps.vars.outputs.DISABLE_NET }}" = "true" ]; then
+            mkdir -p config/includes.chroot/etc/NetworkManager/conf.d
+            cat > config/includes.chroot/etc/NetworkManager/conf.d/00-offline.conf <<'EOF'
+            [main]
+            networking=false
+            EOF
+          fi
+
+          # ---- Hook to refresh initramfs (good practice after injecting files)
+          cat > config/hooks/normal/99-update-initramfs.chroot <<'EOF'
+          #!/bin/sh
+          set -e
+          update-initramfs -u
+          EOF
+          chmod +x config/hooks/normal/99-update-initramfs.chroot
+
+      - name: Fetch and verify latest Trezor Suite AppImage
+        run: |
+          set -euxo pipefail
+          mkdir -p build-cache
+          pushd build-cache
+          curl -L "https://suite.trezor.io/web/static/media/trezor-suite-latest.AppImage" -o trezor-suite.AppImage
+          curl -L "https://suite.trezor.io/static/trezor-suite-latest.AppImage.asc" -o trezor-suite.AppImage.asc
+
+          # Import Trezor key & verify signature
+          gpg --keyserver hkps://keys.openpgp.org --recv-keys "${TREZOR_SIGNING_KEYID}" || \
+          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${TREZOR_SIGNING_KEYID}"
+          gpg --verify trezor-suite.AppImage.asc trezor-suite.AppImage
+
+          chmod +x trezor-suite.AppImage
+          popd
+
+          # Place into includes
+          cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
+
+      - name: Configure live-build (Ubuntu)
+        run: |
+          set -euxo pipefail
+          CODENAME="${{ steps.vars.outputs.CODENAME }}"
+
+          # Clean config/bootstrap area if needed
+          sudo lb clean || true
+
+          # Configure live-build to use Ubuntu mirrors and codename
+          lb config \
+            --mode ubuntu \
+            --distribution "${CODENAME}" \
+            --binary-images iso-hybrid \
+            --archive-areas "main restricted universe multiverse" \
+            --parent-mirror-bootstrap "${UBUNTU_MIRROR}" \
+            --parent-mirror-chroot "${UBUNTU_MIRROR}" \
+            --parent-mirror-chroot-security "${UBUNTU_SECURITY}" \
+            --parent-mirror-binary "${UBUNTU_MIRROR}" \
+            --parent-mirror-binary-security "${UBUNTU_SECURITY}" \
+            --apt-recommends true \
+            --debian-installer false \
+            --bootappend-live "boot=casper quiet splash" \
+            --linux-flavours "generic" \
+            --iso-application "Ubuntu Live (Trezor Suite)" \
+            --iso-volume "${{ steps.vars.outputs.VOL }}" \
+            --checksums "sha256"
+
+      - name: Build ISO (live-build)
+        run: |
+          set -euxo pipefail
+          # Build step (may take a while)
+          sudo lb build
+
+          # Artifact ends up as live-image-amd64.hybrid.iso (name may vary by lb version)
+          # Normalize name
+          LB_OUT=$(ls -1 *.iso | head -n1)
+          echo "LB_OUT=${LB_OUT}" >> $GITHUB_ENV
+          cp "${LB_OUT}" "${TAILORED_ISO_NAME}"
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAILORED_ISO_NAME }}
+          path: ${{ env.TAILORED_ISO_NAME }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: livebuild-${{ steps.vars.outputs.CODENAME }}-${{ github.run_id }}
+          name: "Live-Build Ubuntu + Trezor Suite (${{
+            steps.vars.outputs.CODENAME }})"
+          files: |
+            ${{ env.TAILORED_ISO_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ----------------------------
+  # 2) Fallback: remaster official ISO (more tolerant)
+  #    Runs only if live_build fails (e.g., Ubuntu changed seeds/layout).
+  # ----------------------------
+  fallback_remaster:
+    needs: live_build
+    if: ${{ failure() }}
+    runs-on: ubuntu-22.04
+    env:
+      TAILORED_ISO_NAME: "ubuntu-remaster-trezor.iso"
+      TREZOR_SIGNING_KEYID: "0x86E0D76E6D53CAC6"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xorriso isolinux syslinux-utils dosfstools \
+            squashfs-tools genisoimage \
+            gpg wget curl rsync p7zip-full \
+            gdisk mtools
+
+      - name: Resolve inputs
+        id: vars
+        run: |
+          CODENAME="${{ github.event.inputs.ubuntu_codename || 'jammy' }}"
+          echo "CODENAME=$CODENAME" >> $GITHUB_OUTPUT
+
+          if [ "$CODENAME" = "noble" ]; then
+            ISO="ubuntu-24.04.1-desktop-amd64.iso"
+            BASE="https://releases.ubuntu.com/24.04"
+          else
+            ISO="ubuntu-22.04.5-desktop-amd64.iso"
+            BASE="https://releases.ubuntu.com/22.04"
+          fi
+
+          echo "ISO=$ISO" >> $GITHUB_OUTPUT
+          echo "BASE=$BASE" >> $GITHUB_OUTPUT
+
+      - name: Download official Ubuntu ISO + SHA256SUMS (+ sig)
+        run: |
+          set -euxo pipefail
+          wget -q "${{ steps.vars.outputs.BASE }}/${{ steps.vars.outputs.ISO }}" -O ubuntu.iso
+          wget -q "${{ steps.vars.outputs.BASE }}/SHA256SUMS" -O SHA256SUMS
+          wget -q "${{ steps.vars.outputs.BASE }}/SHA256SUMS.gpg" -O SHA256SUMS.gpg
+          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 0x46181433FBB75451
+          gpg --verify SHA256SUMS.gpg SHA256SUMS
+          sha256sum ubuntu.iso | awk '{print $1}' | grep -F -f <(awk '{print $1}' SHA256SUMS)
+
+      - name: Mount and copy ISO
+        run: |
+          mkdir -p mnt iso
+          sudo mount -o loop ubuntu.iso mnt
+          rsync -aHAX mnt/ iso/
+          sudo umount mnt
+          rmdir mnt
+
+      - name: Unpack SquashFS
+        run: |
+          mkdir -p squashfs-root
+          sudo unsquashfs -d squashfs-root iso/casper/filesystem.squashfs
+
+      - name: Add libfuse2 + udev rules inside chroot (ensures AppImage works)
+        run: |
+          sudo mount --bind /dev  squashfs-root/dev
+          sudo mount --bind /proc squashfs-root/proc
+          sudo mount --bind /sys  squashfs-root/sys
+          sudo chroot squashfs-root /bin/bash -c "apt-get update && apt-get install -y --no-install-recommends libfuse2 && apt-get clean && rm -rf /var/lib/apt/lists/*"
+          sudo umount -l squashfs-root/dev squashfs-root/proc squashfs-root/sys
+
+          sudo mkdir -p squashfs-root/etc/udev/rules.d
+          cat <<'EOF' | sudo tee squashfs-root/etc/udev/rules.d/51-trezor.rules >/dev/null
+          SUBSYSTEM=="hidraw", ATTRS{idVendor}=="534c", MODE="0666"
+          SUBSYSTEM=="usb", ATTR{idVendor}=="534c", MODE="0666"
+          EOF
+
+      - name: Download and verify latest Trezor Suite
+        run: |
+          mkdir -p inject
+          curl -L "https://suite.trezor.io/web/static/media/trezor-suite-latest.AppImage" -o inject/trezor-suite.AppImage
+          curl -L "https://suite.trezor.io/static/trezor-suite-latest.AppImage.asc" -o inject/trezor-suite.AppImage.asc
+          gpg --keyserver hkps://keys.openpgp.org --recv-keys "${TREZOR_SIGNING_KEYID}" || \
+          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${TREZOR_SIGNING_KEYID}"
+          gpg --verify inject/trezor-suite.AppImage.asc inject/trezor-suite.AppImage
+          chmod +x inject/trezor-suite.AppImage
+
+      - name: Inject AppImage + desktop launcher
+        run: |
+          sudo mkdir -p squashfs-root/opt/trezor
+          sudo cp inject/trezor-suite.AppImage squashfs-root/opt/trezor/trezor-suite.AppImage
+
+          sudo mkdir -p squashfs-root/usr/share/applications
+          cat <<'EOF' | sudo tee squashfs-root/usr/share/applications/trezor-suite.desktop >/dev/null
+          [Desktop Entry]
+          Name=Trezor Suite
+          Exec=/opt/trezor/trezor-suite.AppImage
+          Icon=utilities-terminal
+          Type=Application
+          Categories=Finance;Utility;
+          Terminal=false
+          EOF
+
+      - name: (Optional) Disable networking by default
+        if: ${{ github.event.inputs.disable_network_by_default == 'true' }}
+        run: |
+          sudo mkdir -p squashfs-root/etc/NetworkManager/conf.d
+          cat <<'EOF' | sudo tee squashfs-root/etc/NetworkManager/conf.d/00-offline.conf >/dev/null
+          [main]
+          networking=false
+          EOF
+
+      - name: Repack SquashFS + filesystem.size
+        run: |
+          sudo mksquashfs squashfs-root iso/casper/filesystem.squashfs -noappend -comp xz
+          printf $(sudo du -sx --block-size=1 squashfs-root | cut -f1) | sudo tee iso/casper/filesystem.size >/dev/null
+
+      - name: Rebuild ISO (auto-detect EFI image)
+        run: |
+          set -euxo pipefail
+          EFI_IMG=""
+          [ -f iso/boot/grub/efi.img ] && EFI_IMG="iso/boot/grub/efi.img"
+          [ -f iso/EFI/boot/bootx64.efi ] && EFI_IMG="iso/EFI/boot/bootx64.efi"
+          if [ -z "$EFI_IMG" ]; then echo "EFI image not found"; exit 1; fi
+
+          BIOS_OPTS=""
+          if [ -f iso/isolinux/isolinux.bin ] && [ -f iso/isolinux/boot.cat ]; then
+            BIOS_OPTS="-b isolinux/isolinux.bin -c isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table"
+          fi
+
+          xorriso -as mkisofs \
+            -r -V "UBUNTU_TREZOR_REMASTER" \
+            -o "${TAILORED_ISO_NAME}" \
+            -J -l -cache-inodes -iso-level 3 \
+            ${BIOS_OPTS} \
+            -eltorito-alt-boot -e "${EFI_IMG#iso/}" -no-emul-boot \
+            -isohybrid-mbr iso/isolinux/isohdpfx.bin 2>/dev/null || true
+
+          isohybrid --uefi "${TAILORED_ISO_NAME}" 2>/dev/null || true
+          sha256sum "${TAILORED_ISO_NAME}" | tee iso.sha256
+
+      - name: Upload remastered ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAILORED_ISO_NAME }}
+          path: |
+            ${{ env.TAILORED_ISO_NAME }}
+            iso.sha256
+          retention-days: 14
