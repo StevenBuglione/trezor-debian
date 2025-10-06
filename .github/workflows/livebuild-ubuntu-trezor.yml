@@ -1,4 +1,4 @@
-name: Live-Build Ubuntu + Trezor Suite ISO
+name: Live-Build Ubuntu + Trezor Suite ISO (with fallback & debug logs)
 
 on:
   schedule:
@@ -14,60 +14,78 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: write
+
+env:
+  # Key IDs & expected fingerprints
+  UBUNTU_KEY_2012: "0xD94AA3F0EFE21092"
+  UBUNTU_KEY_2012_FPR: "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+  UBUNTU_KEY_2018: "0x46181433FBB75451"
+  UBUNTU_KEY_2018_FPR: "C5986B4F1257FFA86632CBA746181433FBB75451"
+  TREZOR_SIGNING_KEYID: "0x86E0D76E6D53CAC6"
+  TAILORED_ISO_NAME: "ubuntu-live-trezor.iso"
+
 jobs:
-  # ----------------------------
-  # 1) Primary: build via live-build
-  # ----------------------------
+  # =========================
+  # 1) Primary: live-build
+  # =========================
   live_build:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
+    timeout-minutes: 120
     env:
-      # Mirrors (you can point to your regional mirror if you want)
       UBUNTU_MIRROR: "http://archive.ubuntu.com/ubuntu/"
       UBUNTU_SECURITY: "http://security.ubuntu.com/ubuntu/"
-      # Keys to pin
-      TREZOR_SIGNING_KEYID: "0x86E0D76E6D53CAC6"
-      TAILORED_ISO_NAME: "ubuntu-live-trezor.iso"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show runner details
+        run: |
+          set -euxo pipefail
+          uname -a
+          lsb_release -a || true
+          df -h
+          free -h
+
       - name: Install host tools
         run: |
+          set -euxo pipefail
           sudo apt-get update
+          # Note: ubuntu-archive-keyring is NOT present on jammy; use ubuntu-keyring
           sudo apt-get install -y \
             live-build debootstrap cdebootstrap \
             xorriso squashfs-tools genisoimage \
             dosfstools syslinux-utils isolinux \
             gpg wget curl rsync ca-certificates \
-            ubuntu-keyring ubuntu-archive-keyring
+            ubuntu-keyring
+          live-build --version || true
 
-      - name: Resolve inputs
+      - name: Resolve inputs / variables
         id: vars
         run: |
-          echo "CODENAME=${{ github.event.inputs.ubuntu_codename || 'jammy' }}" >> $GITHUB_OUTPUT
-          echo "DISABLE_NET=${{ github.event.inputs.disable_network_by_default == 'true' && 'true' || 'false' }}" >> $GITHUB_OUTPUT
-          # human-friendly label
-          echo "VOL=UBUNTU_${{ github.event.inputs.ubuntu_codename || 'jammy' }}_TREZOR" >> $GITHUB_OUTPUT
+          set -euxo pipefail
+          CODENAME="${{ github.event.inputs.ubuntu_codename || 'jammy' }}"
+          echo "CODENAME=$CODENAME" >> $GITHUB_OUTPUT
+          DISABLE="${{ github.event.inputs.disable_network_by_default == 'true' && 'true' || 'false' }}"
+          echo "DISABLE_NET=$DISABLE" >> $GITHUB_OUTPUT
+          echo "VOL=UBUNTU_${CODENAME}_TREZOR" >> $GITHUB_OUTPUT
 
       - name: Prepare live-build config
         run: |
           set -euxo pipefail
-
           # Clean any previous state
           sudo lb clean || true
-          rm -rf config
+          rm -rf config build-cache logs || true
           mkdir -p config/includes.chroot/opt/trezor
           mkdir -p config/includes.chroot/usr/share/applications
           mkdir -p config/includes.chroot/etc/udev/rules.d
           mkdir -p config/package-lists
           mkdir -p config/hooks/normal
+          mkdir -p logs
 
-          # ---- Package list (ensure AppImage support + desktop basics)
+          # Minimal desktop bits & AppImage runtime (libfuse2)
           cat > config/package-lists/base.list.chroot <<'EOF'
-          # Minimal desktop bits so AppImage can run and NetworkManager is available
           ubuntu-standard
           casper
           linux-generic
@@ -75,21 +93,18 @@ jobs:
           xorg
           xserver-xorg
           libfuse2
-          # optional niceties
           xdg-utils
           gvfs
-          # udev is already part of base, but keep here for clarity
           udev
           EOF
 
-          # ---- udev rules to allow Trezor access in live session
+          # Trezor udev rules (permissive for ephemeral live session)
           cat > config/includes.chroot/etc/udev/rules.d/51-trezor.rules <<'EOF'
-          # Trezor (usb/hidraw) – permissive for ephemeral live session
           SUBSYSTEM=="hidraw", ATTRS{idVendor}=="534c", MODE="0666"
-          SUBSYSTEM=="usb", ATTR{idVendor}=="534c", MODE="0666"
+          SUBSYSTEM=="usb",   ATTR{idVendor}=="534c", MODE="0666"
           EOF
 
-          # ---- Desktop launcher
+          # Trezor Suite desktop launcher
           cat > config/includes.chroot/usr/share/applications/trezor-suite.desktop <<'EOF'
           [Desktop Entry]
           Name=Trezor Suite
@@ -100,7 +115,7 @@ jobs:
           Terminal=false
           EOF
 
-          # ---- Optional: disable NetworkManager by default
+          # Optional: disable networking by default
           if [ "${{ steps.vars.outputs.DISABLE_NET }}" = "true" ]; then
             mkdir -p config/includes.chroot/etc/NetworkManager/conf.d
             cat > config/includes.chroot/etc/NetworkManager/conf.d/00-offline.conf <<'EOF'
@@ -109,31 +124,32 @@ jobs:
             EOF
           fi
 
-          # ---- Hook to refresh initramfs (good practice after injecting files)
+          # Hook: update initramfs (good hygiene when injecting files)
           cat > config/hooks/normal/99-update-initramfs.chroot <<'EOF'
           #!/bin/sh
-          set -e
+          set -eux
           update-initramfs -u
           EOF
           chmod +x config/hooks/normal/99-update-initramfs.chroot
 
-      - name: Fetch and verify latest Trezor Suite AppImage
+      - name: Fetch & verify latest Trezor Suite AppImage
         run: |
           set -euxo pipefail
+          retry() { for i in 1 2 3; do "$@" && return 0 || sleep 2; done; return 1; }
+
           mkdir -p build-cache
           pushd build-cache
-          curl -L "https://suite.trezor.io/web/static/media/trezor-suite-latest.AppImage" -o trezor-suite.AppImage
-          curl -L "https://suite.trezor.io/static/trezor-suite-latest.AppImage.asc" -o trezor-suite.AppImage.asc
+          retry curl -L "https://suite.trezor.io/web/static/media/trezor-suite-latest.AppImage" -o trezor-suite.AppImage
+          retry curl -L "https://suite.trezor.io/static/trezor-suite-latest.AppImage.asc" -o trezor-suite.AppImage.asc
 
-          # Import Trezor key & verify signature
-          gpg --keyserver hkps://keys.openpgp.org --recv-keys "${TREZOR_SIGNING_KEYID}" || \
-          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${TREZOR_SIGNING_KEYID}"
-          gpg --verify trezor-suite.AppImage.asc trezor-suite.AppImage
-
+          # Import Trezor key & verify signature (with retry/keyserver fallback)
+          retry gpg --keyserver hkps://keys.openpgp.org --recv-keys "${TREZOR_SIGNING_KEYID}" || \
+          retry gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${TREZOR_SIGNING_KEYID}"
+          gpg --batch --verify trezor-suite.AppImage.asc trezor-suite.AppImage
           chmod +x trezor-suite.AppImage
           popd
 
-          # Place into includes
+          # Place into the image
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
 
       - name: Configure live-build (Ubuntu)
@@ -141,20 +157,17 @@ jobs:
           set -euxo pipefail
           CODENAME="${{ steps.vars.outputs.CODENAME }}"
 
-          # Clean config/bootstrap area if needed
           sudo lb clean || true
-
-          # Configure live-build to use Ubuntu mirrors and codename
           lb config \
             --mode ubuntu \
             --distribution "${CODENAME}" \
             --binary-images iso-hybrid \
             --archive-areas "main restricted universe multiverse" \
-            --parent-mirror-bootstrap "${UBUNTU_MIRROR}" \
-            --parent-mirror-chroot "${UBUNTU_MIRROR}" \
-            --parent-mirror-chroot-security "${UBUNTU_SECURITY}" \
-            --parent-mirror-binary "${UBUNTU_MIRROR}" \
-            --parent-mirror-binary-security "${UBUNTU_SECURITY}" \
+            --parent-mirror-bootstrap "http://archive.ubuntu.com/ubuntu/" \
+            --parent-mirror-chroot "http://archive.ubuntu.com/ubuntu/" \
+            --parent-mirror-chroot-security "http://security.ubuntu.com/ubuntu/" \
+            --parent-mirror-binary "http://archive.ubuntu.com/ubuntu/" \
+            --parent-mirror-binary-security "http://security.ubuntu.com/ubuntu/" \
             --apt-recommends true \
             --debian-installer false \
             --bootappend-live "boot=casper quiet splash" \
@@ -163,68 +176,84 @@ jobs:
             --iso-volume "${{ steps.vars.outputs.VOL }}" \
             --checksums "sha256"
 
-      - name: Build ISO (live-build)
+      - name: Build ISO (live-build) with verbose logs
         run: |
           set -euxo pipefail
-          # Build step (may take a while)
-          sudo lb build
-
-          # Artifact ends up as live-image-amd64.hybrid.iso (name may vary by lb version)
-          # Normalize name
+          # Keep verbose logs to help debug failures
+          (time sudo lb build) 2>&1 | tee logs/live-build.log
           LB_OUT=$(ls -1 *.iso | head -n1)
           echo "LB_OUT=${LB_OUT}" >> $GITHUB_ENV
           cp "${LB_OUT}" "${TAILORED_ISO_NAME}"
+          sha256sum "${TAILORED_ISO_NAME}" | tee ubuntu-live-trezor.iso.sha256
 
-      - name: Upload ISO artifact
+      - name: Collect logs (tarball)
+        if: always()
+        run: |
+          set -euxo pipefail
+          tar -czf build-logs.tar.gz logs config || true
+          ls -lah || true
+
+      - name: Upload ISO + checksums + logs
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.TAILORED_ISO_NAME }}
-          path: ${{ env.TAILORED_ISO_NAME }}
+          name: livebuild-output
+          path: |
+            ${{ env.TAILORED_ISO_NAME }}
+            ubuntu-live-trezor.iso.sha256
+            build-logs.tar.gz
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 21
 
-      - name: Publish GitHub Release
+      - name: Publish GitHub Release (live-build)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: livebuild-${{ steps.vars.outputs.CODENAME }}-${{ github.run_id }}
           name: "Live-Build Ubuntu + Trezor Suite (${{
             steps.vars.outputs.CODENAME }})"
+          draft: false
+          prerelease: false
           files: |
             ${{ env.TAILORED_ISO_NAME }}
+            ubuntu-live-trezor.iso.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ----------------------------
-  # 2) Fallback: remaster official ISO (more tolerant)
-  #    Runs only if live_build fails (e.g., Ubuntu changed seeds/layout).
-  # ----------------------------
+  # =========================
+  # 2) Fallback: remaster official ISO
+  #    Only runs if live_build failed
+  # =========================
   fallback_remaster:
     needs: live_build
     if: ${{ failure() }}
     runs-on: ubuntu-22.04
-    env:
-      TAILORED_ISO_NAME: "ubuntu-remaster-trezor.iso"
-      TREZOR_SIGNING_KEYID: "0x86E0D76E6D53CAC6"
-
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Host tools
+      - name: Show runner details
         run: |
+          set -euxo pipefail
+          uname -a
+          lsb_release -a || true
+          df -h
+          free -h
+
+      - name: Install tools
+        run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             xorriso isolinux syslinux-utils dosfstools \
             squashfs-tools genisoimage \
             gpg wget curl rsync p7zip-full \
-            gdisk mtools
+            gdisk mtools ubuntu-keyring
 
-      - name: Resolve inputs
+      - name: Resolve inputs / ISO URLs
         id: vars
         run: |
+          set -euxo pipefail
           CODENAME="${{ github.event.inputs.ubuntu_codename || 'jammy' }}"
-          echo "CODENAME=$CODENAME" >> $GITHUB_OUTPUT
-
           if [ "$CODENAME" = "noble" ]; then
             ISO="ubuntu-24.04.1-desktop-amd64.iso"
             BASE="https://releases.ubuntu.com/24.04"
@@ -232,22 +261,42 @@ jobs:
             ISO="ubuntu-22.04.5-desktop-amd64.iso"
             BASE="https://releases.ubuntu.com/22.04"
           fi
-
+          echo "CODENAME=$CODENAME" >> $GITHUB_OUTPUT
           echo "ISO=$ISO" >> $GITHUB_OUTPUT
           echo "BASE=$BASE" >> $GITHUB_OUTPUT
 
-      - name: Download official Ubuntu ISO + SHA256SUMS (+ sig)
+      - name: Download ISO + checksums
         run: |
           set -euxo pipefail
-          wget -q "${{ steps.vars.outputs.BASE }}/${{ steps.vars.outputs.ISO }}" -O ubuntu.iso
-          wget -q "${{ steps.vars.outputs.BASE }}/SHA256SUMS" -O SHA256SUMS
-          wget -q "${{ steps.vars.outputs.BASE }}/SHA256SUMS.gpg" -O SHA256SUMS.gpg
-          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 0x46181433FBB75451
-          gpg --verify SHA256SUMS.gpg SHA256SUMS
+          retry() { for i in 1 2 3; do "$@" && return 0 || sleep 2; done; return 1; }
+
+          retry wget -q "${{ steps.vars.outputs.BASE }}/${{ steps.vars.outputs.ISO }}" -O ubuntu.iso
+          retry wget -q "${{ steps.vars.outputs.BASE }}/SHA256SUMS" -O SHA256SUMS
+          retry wget -q "${{ steps.vars.outputs.BASE }}/SHA256SUMS.gpg" -O SHA256SUMS.gpg
+          ls -lh ubuntu.iso SHA256SUMS SHA256SUMS.gpg
+
+      - name: Import BOTH Ubuntu signing keys & pin fingerprints
+        run: |
+          set -euxo pipefail
+          retry() { for i in 1 2 3; do "$@" && return 0 || sleep 2; done; return 1; }
+
+          # Import both keys (2012 + 2018), from two servers if needed
+          retry gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "$UBUNTU_KEY_2012" "$UBUNTU_KEY_2018" || \
+          retry gpg --keyserver hkps://keys.openpgp.org   --recv-keys "$UBUNTU_KEY_2012" "$UBUNTU_KEY_2018"
+
+          # Pin fingerprints
+          FPR2012=$(gpg --with-colons --fingerprint "$UBUNTU_KEY_2012" | awk -F: '/^fpr:/ {print $10; exit}')
+          FPR2018=$(gpg --with-colons --fingerprint "$UBUNTU_KEY_2018" | awk -F: '/^fpr:/ {print $10; exit}')
+          [ "$FPR2012" = "$UBUNTU_KEY_2012_FPR" ] || { echo "2012 key fingerprint mismatch: $FPR2012"; exit 2; }
+          [ "$FPR2018" = "$UBUNTU_KEY_2018_FPR" ] || { echo "2018 key fingerprint mismatch: $FPR2018"; exit 2; }
+
+          # Verify SHA256SUMS signature & ISO checksum
+          gpg --batch --verify SHA256SUMS.gpg SHA256SUMS
           sha256sum ubuntu.iso | awk '{print $1}' | grep -F -f <(awk '{print $1}' SHA256SUMS)
 
-      - name: Mount and copy ISO
+      - name: Mount & copy ISO
         run: |
+          set -euxo pipefail
           mkdir -p mnt iso
           sudo mount -o loop ubuntu.iso mnt
           rsync -aHAX mnt/ iso/
@@ -256,35 +305,42 @@ jobs:
 
       - name: Unpack SquashFS
         run: |
+          set -euxo pipefail
           mkdir -p squashfs-root
           sudo unsquashfs -d squashfs-root iso/casper/filesystem.squashfs
 
-      - name: Add libfuse2 + udev rules inside chroot (ensures AppImage works)
+      - name: Add libfuse2 + udev rules in chroot (AppImage support)
         run: |
+          set -euxo pipefail
           sudo mount --bind /dev  squashfs-root/dev
           sudo mount --bind /proc squashfs-root/proc
           sudo mount --bind /sys  squashfs-root/sys
-          sudo chroot squashfs-root /bin/bash -c "apt-get update && apt-get install -y --no-install-recommends libfuse2 && apt-get clean && rm -rf /var/lib/apt/lists/*"
+          sudo chroot squashfs-root /bin/bash -c "set -euxo pipefail; apt-get update; apt-get install -y --no-install-recommends libfuse2; apt-get clean; rm -rf /var/lib/apt/lists/*"
           sudo umount -l squashfs-root/dev squashfs-root/proc squashfs-root/sys
 
           sudo mkdir -p squashfs-root/etc/udev/rules.d
           cat <<'EOF' | sudo tee squashfs-root/etc/udev/rules.d/51-trezor.rules >/dev/null
           SUBSYSTEM=="hidraw", ATTRS{idVendor}=="534c", MODE="0666"
-          SUBSYSTEM=="usb", ATTR{idVendor}=="534c", MODE="0666"
+          SUBSYSTEM=="usb",   ATTR{idVendor}=="534c", MODE="0666"
           EOF
 
-      - name: Download and verify latest Trezor Suite
+      - name: Download & verify latest Trezor Suite
         run: |
+          set -euxo pipefail
+          retry() { for i in 1 2 3; do "$@" && return 0 || sleep 2; done; return 1; }
+
           mkdir -p inject
-          curl -L "https://suite.trezor.io/web/static/media/trezor-suite-latest.AppImage" -o inject/trezor-suite.AppImage
-          curl -L "https://suite.trezor.io/static/trezor-suite-latest.AppImage.asc" -o inject/trezor-suite.AppImage.asc
-          gpg --keyserver hkps://keys.openpgp.org --recv-keys "${TREZOR_SIGNING_KEYID}" || \
-          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${TREZOR_SIGNING_KEYID}"
-          gpg --verify inject/trezor-suite.AppImage.asc inject/trezor-suite.AppImage
+          retry curl -L "https://suite.trezor.io/web/static/media/trezor-suite-latest.AppImage" -o inject/trezor-suite.AppImage
+          retry curl -L "https://suite.trezor.io/static/trezor-suite-latest.AppImage.asc" -o inject/trezor-suite.AppImage.asc
+
+          retry gpg --keyserver hkps://keys.openpgp.org --recv-keys "${TREZOR_SIGNING_KEYID}" || \
+          retry gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "${TREZOR_SIGNING_KEYID}"
+          gpg --batch --verify inject/trezor-suite.AppImage.asc inject/trezor-suite.AppImage
           chmod +x inject/trezor-suite.AppImage
 
-      - name: Inject AppImage + desktop launcher
+      - name: Inject AppImage + desktop launcher (+ optional offline)
         run: |
+          set -euxo pipefail
           sudo mkdir -p squashfs-root/opt/trezor
           sudo cp inject/trezor-suite.AppImage squashfs-root/opt/trezor/trezor-suite.AppImage
 
@@ -299,49 +355,51 @@ jobs:
           Terminal=false
           EOF
 
-      - name: (Optional) Disable networking by default
-        if: ${{ github.event.inputs.disable_network_by_default == 'true' }}
-        run: |
-          sudo mkdir -p squashfs-root/etc/NetworkManager/conf.d
-          cat <<'EOF' | sudo tee squashfs-root/etc/NetworkManager/conf.d/00-offline.conf >/dev/null
-          [main]
-          networking=false
-          EOF
+          if [ "${{ github.event.inputs.disable_network_by_default }}" = "true" ]; then
+            sudo mkdir -p squashfs-root/etc/NetworkManager/conf.d
+            cat <<'EOF' | sudo tee squashfs-root/etc/NetworkManager/conf.d/00-offline.conf >/dev/null
+            [main]
+            networking=false
+            EOF
+          fi
 
-      - name: Repack SquashFS + filesystem.size
+      - name: Repack SquashFS & update filesystem.size
         run: |
-          sudo mksquashfs squashfs-root iso/casper/filesystem.squashfs -noappend -comp xz
+          set -euxo pipefail
+          (time sudo mksquashfs squashfs-root iso/casper/filesystem.squashfs -noappend -comp xz) 2>&1 | tee repack.log
           printf $(sudo du -sx --block-size=1 squashfs-root | cut -f1) | sudo tee iso/casper/filesystem.size >/dev/null
 
-      - name: Rebuild ISO (auto-detect EFI image)
+      - name: Rebuild ISO (auto-detect EFI image) + logs
         run: |
           set -euxo pipefail
           EFI_IMG=""
           [ -f iso/boot/grub/efi.img ] && EFI_IMG="iso/boot/grub/efi.img"
           [ -f iso/EFI/boot/bootx64.efi ] && EFI_IMG="iso/EFI/boot/bootx64.efi"
-          if [ -z "$EFI_IMG" ]; then echo "EFI image not found"; exit 1; fi
+          if [ -z "$EFI_IMG" ]; then echo "EFI image not found"; ls -R iso || true; exit 1; fi
 
           BIOS_OPTS=""
           if [ -f iso/isolinux/isolinux.bin ] && [ -f iso/isolinux/boot.cat ]; then
             BIOS_OPTS="-b isolinux/isolinux.bin -c isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table"
           fi
 
-          xorriso -as mkisofs \
+          (time xorriso -as mkisofs \
             -r -V "UBUNTU_TREZOR_REMASTER" \
             -o "${TAILORED_ISO_NAME}" \
             -J -l -cache-inodes -iso-level 3 \
             ${BIOS_OPTS} \
             -eltorito-alt-boot -e "${EFI_IMG#iso/}" -no-emul-boot \
-            -isohybrid-mbr iso/isolinux/isohdpfx.bin 2>/dev/null || true
+            -isohybrid-mbr iso/isolinux/isohdpfx.bin) 2>&1 | tee mkisofs.log || true
 
-          isohybrid --uefi "${TAILORED_ISO_NAME}" 2>/dev/null || true
-          sha256sum "${TAILORED_ISO_NAME}" | tee iso.sha256
+          isohybrid --uefi "${TAILORED_ISO_NAME}" 2>&1 | tee -a mkisofs.log || true
+          sha256sum "${TAILORED_ISO_NAME}" | tee ubuntu-remaster-trezor.iso.sha256
+          tar -czf fallback-logs.tgz repack.log mkisofs.log || true
 
-      - name: Upload remastered ISO
+      - name: Upload remastered ISO + checksums + logs
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.TAILORED_ISO_NAME }}
+          name: remaster-output
           path: |
             ${{ env.TAILORED_ISO_NAME }}
-            iso.sha256
-          retention-days: 14
+            ubuntu-remaster-trezor.iso.sha256
+            fallback-logs.tgz
+          retention-days: 21
