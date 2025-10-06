@@ -12,13 +12,9 @@ on:
 
 jobs:
   build-debian-live:
-    runs-on: ubuntu-latest
+    # IMPORTANT: run on the host VM (no container), so mount() in chroot works.
+    runs-on: ubuntu-24.04
 
-    # Build *inside* Debian bookworm for maximum compatibility with live-build.
-    container:
-      image: debian:bookworm
-
-    # IMPORTANT: default shell in containers is 'sh'; force bash to use 'set -o pipefail', etc.
     defaults:
       run:
         shell: bash
@@ -41,9 +37,8 @@ jobs:
       - name: Prep APT & tools
         run: |
           set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             live-build debootstrap \
             xorriso squashfs-tools dosfstools mtools \
             grub-pc-bin grub-efi-amd64-bin \
@@ -63,7 +58,6 @@ jobs:
           mkdir -p config/package-lists
           mkdir -p logs build-cache auto
 
-      # ---------- Minimal desktop & helpers so Trezor Suite (GUI) runs out-of-the-box ----------
       - name: Package list (XFCE + essentials)
         run: |
           set -euo pipefail
@@ -96,7 +90,6 @@ jobs:
           Categories=Finance;Utility;
           EOF
 
-      # ---------- Fetch Trezor Suite from GitHub Releases & verify with pinned VALIDSIG ----------
       - name: Fetch Trezor Suite assets
         id: suite
         run: |
@@ -127,7 +120,6 @@ jobs:
               build-cache/trezor-suite.AppImage.asc build-cache/trezor-suite.AppImage \
               1> logs/gpg-status.log 2> logs/gpg-stderr.log || true
 
-          # Must have GOODSIG and VALIDSIG matching the pinned fingerprint
           GOODSIG_COUNT=$(awk 'BEGIN{c=0} /^\[GNUPG:\] GOODSIG /{c++} END{print c}' logs/gpg-status.log)
           SIG_FPR=$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' logs/gpg-status.log)
           echo "GOODSIG count: ${GOODSIG_COUNT:-0}"
@@ -137,9 +129,7 @@ jobs:
           fi
           chmod +x build-cache/trezor-suite.AppImage
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
-          ls -l config/includes.chroot/opt/trezor/
 
-      # ---------- Post-install hook: small niceties ----------
       - name: Hook (post-install in chroot)
         run: |
           set -euo pipefail
@@ -147,16 +137,14 @@ jobs:
           #!/bin/bash
           set -euo pipefail
           chmod +x /opt/trezor/trezor-suite.AppImage || true
-          # Make sure udev is active; XFCE autologin is *not* forced for safety.
           EOF
           chmod +x config/hooks/normal/00-post-install.chroot
 
-      # ---------- Configure live-build for Debian bookworm ----------
       - name: Configure live-build (GRUB for BIOS+UEFI, memtest off)
         run: |
           set -euo pipefail
-          lb clean --purge || true
-          lb config noauto \
+          sudo lb clean --purge || true
+          sudo lb config noauto \
             --mode debian \
             --architectures "${ARCH}" \
             --distribution "${SUITE}" \
@@ -182,7 +170,7 @@ jobs:
       - name: Build ISO (verbose)
         run: |
           set -euo pipefail
-          time lb build 2> logs/live-build-stderr.log | tee logs/live-build.log
+          time sudo lb build 2> logs/live-build-stderr.log | tee logs/live-build.log
           echo "::group::Produced files"; ls -lah || true; echo "::endgroup::"
 
       - name: Rename ISO + checksums
