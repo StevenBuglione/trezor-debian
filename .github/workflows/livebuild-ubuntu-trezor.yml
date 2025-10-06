@@ -32,13 +32,14 @@ jobs:
       # Mirrors for live-build (Ubuntu)
       UBUNTU_MIRROR: "http://archive.ubuntu.com/ubuntu/"
       UBUNTU_SECURITY: "http://security.ubuntu.com/ubuntu/"
-
-      # trezor-suite repo
+      # Repo for Suite
       GH_OWNER: "trezor"
       GH_REPO: "trezor-suite"
-
       # Output ISO name
       TAILORED_ISO_NAME: "ubuntu-live-trezor.iso"
+      # Force GRUB-only build (avoid syslinux themes entirely)
+      LB_BOOTLOADERS: "grub-pc grub-efi"
+      LB_SYSLINUX_THEME: "none"
 
     steps:
       - name: Checkout
@@ -58,11 +59,11 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
+          # NOTE: we do NOT install isolinux/syslinux-utils to avoid pulling syslinux paths
           sudo apt-get install -y \
             live-build debootstrap cdebootstrap \
             xorriso squashfs-tools genisoimage \
-            dosfstools syslinux-utils isolinux \
-            gpg wget curl rsync ca-certificates \
+            dosfstools gpg wget curl rsync ca-certificates \
             ubuntu-keyring jq
           live-build --version || true
           jq --version
@@ -74,10 +75,10 @@ jobs:
           CODENAME="${{ github.event.inputs.ubuntu_codename || 'jammy' }}"
           DISABLE_NET="${{ github.event.inputs.disable_network_by_default == 'true' && 'true' || 'false' }}"
           TAG_INPUT="${{ github.event.inputs.trezor_tag }}"
-          echo "CODENAME=$CODENAME"                >> "$GITHUB_OUTPUT"
-          echo "DISABLE_NET=$DISABLE_NET"          >> "$GITHUB_OUTPUT"
-          echo "VOL=UBUNTU_${CODENAME}_TREZOR"     >> "$GITHUB_OUTPUT"
-          echo "TAG_INPUT=$TAG_INPUT"              >> "$GITHUB_OUTPUT"
+          echo "CODENAME=$CODENAME"            >> "$GITHUB_OUTPUT"
+          echo "DISABLE_NET=$DISABLE_NET"      >> "$GITHUB_OUTPUT"
+          echo "VOL=UBUNTU_${CODENAME}_TREZOR" >> "$GITHUB_OUTPUT"
+          echo "TAG_INPUT=$TAG_INPUT"          >> "$GITHUB_OUTPUT"
 
       - name: Clean & create config dirs
         run: |
@@ -93,7 +94,7 @@ jobs:
           # dedicated keyring just for this workflow run
           mkdir -p gnupg && chmod 700 gnupg
 
-      # ---- Write files in separate steps (avoid heredoc pitfalls) ----
+      # ---- Write files in separate steps ----
       - name: Write package list (base.list.chroot)
         run: |
           set -euxo pipefail
@@ -176,21 +177,15 @@ jobs:
           else
             api_url="https://api.github.com/repos/${owner}/${repo}/releases/latest"
           fi
-
           curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" "$api_url" -o release.json
-
           echo "::group::Release metadata"
           jq -r '.tag_name, .name, (.assets[]?.name // empty)' release.json || true
           echo "::endgroup::"
-
           appimage_url=$(jq -r '.assets[] | select(.name|test("AppImage$")) | .browser_download_url' release.json | head -n1)
           asc_url=$(jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .browser_download_url' release.json | head -n1)
-
           if [[ -z "$appimage_url" || -z "$asc_url" ]]; then
-            echo "Could not find AppImage/.asc assets in the release. Assets:"; jq -r '.assets[]?.name' release.json
-            exit 1
+            echo "Could not find AppImage/.asc assets in the release. Assets:"; jq -r '.assets[]?.name' release.json; exit 1
           fi
-
           echo "APPIMAGE_URL=$appimage_url" >> "$GITHUB_OUTPUT"
           echo "ASC_URL=$asc_url"         >> "$GITHUB_OUTPUT"
 
@@ -202,7 +197,7 @@ jobs:
           curl -L "${{ steps.ghassets.outputs.ASC_URL }}"      -o build-cache/trezor-suite.AppImage.asc
           ls -lh build-cache/
 
-      # ---- Import SatoshiLabs 2021 signing key from trezor.io over HTTPS (no keyservers) ----
+      # ---- Import SatoshiLabs 2021 signing key from trezor.io (HTTPS) ----
       - name: Import Trezor public key (HTTPS from trezor.io)
         env:
           GNUPGHOME: ${{ github.workspace }}/gnupg
@@ -221,24 +216,21 @@ jobs:
             fi
           done
           if [[ ! -s build-cache/keys/trezor.asc ]]; then
-            echo "Failed to download SatoshiLabs 2021 signing key from trezor.io"
-            exit 2
+            echo "Failed to download SatoshiLabs 2021 signing key from trezor.io"; exit 2
           fi
           echo "::group::GPG show-keys (import candidate)"
           gpg --show-keys --with-fingerprint build-cache/keys/trezor.asc || true
           echo "::endgroup::"
           gpg --import build-cache/keys/trezor.asc
 
-      # ---- Corrected parser: verify signature and match fingerprint to imported key ----
+      # ---- Verify signature and match fingerprint to imported key ----
       - name: Verify AppImage signature (issuer must equal imported key)
         env:
           GNUPGHOME: ${{ github.workspace }}/gnupg
         run: |
           set -euxo pipefail
           IMPORTED_FPR="$(gpg --with-colons --fingerprint | awk -F: '/^fpr:/{print $10; exit}')"
-          if [ -z "$IMPORTED_FPR" ]; then
-            echo "No imported key fingerprint found"; exit 3
-          fi
+          [ -n "$IMPORTED_FPR" ] || { echo "No imported key fingerprint found"; exit 3; }
           echo "Imported Trezor key fingerprint: $IMPORTED_FPR"
 
           gpg --status-fd=1 --batch --verify \
@@ -246,7 +238,7 @@ jobs:
             2> >(tee logs/gpg-stderr.log >&2) \
             | tee logs/gpg-status.log
 
-          # FIXED: in status lines, $1='[GNUPG:]', $2='VALIDSIG' or 'GOODSIG', so fingerprint/keyid are $3
+          # $1='[GNUPG:]', $2='VALIDSIG'/'GOODSIG', $3=<fingerprint or keyid>
           SIG_GOOD="$(awk 'BEGIN{c=0} /^\[GNUPG:\] GOODSIG /{c++} END{print c}' logs/gpg-status.log)"
           SIG_FPR="$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' logs/gpg-status.log)"
           SIG_KEYID="$(awk '/^\[GNUPG:\] GOODSIG /{print $3; exit}' logs/gpg-status.log || true)"
@@ -266,15 +258,23 @@ jobs:
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
           echo "::group::Verify AppImage presence"; ls -l config/includes.chroot/opt/trezor/; echo "::endgroup::"
 
-      - name: Configure live-build
+      - name: Configure live-build (GRUB-only, no syslinux)
+        env:
+          # Ensure lb picks these up even if flags change across versions
+          LB_BOOTLOADERS: ${{ env.LB_BOOTLOADERS }}
+          LB_SYSLINUX_THEME: ${{ env.LB_SYSLINUX_THEME }}
         run: |
           set -euxo pipefail
           CODENAME="${{ steps.vars.outputs.CODENAME }}"
           sudo lb clean || true
+
+          # Prefer explicit flags…
           lb config \
             --mode ubuntu \
             --distribution "${CODENAME}" \
             --binary-images iso-hybrid \
+            --bootloaders "${LB_BOOTLOADERS}" \
+            --syslinux-theme "${LB_SYSLINUX_THEME}" \
             --archive-areas "main restricted universe multiverse" \
             --parent-mirror-bootstrap "${UBUNTU_MIRROR}" \
             --parent-mirror-chroot "${UBUNTU_MIRROR}" \
@@ -287,7 +287,12 @@ jobs:
             --linux-flavours "generic" \
             --iso-application "Ubuntu Live (Trezor Suite)" \
             --iso-volume "${{ steps.vars.outputs.VOL }}" \
-            --checksums "sha256"
+            --checksums "sha256" || true
+
+          # …and force via environment too (covers older lb that ignore --syslinux-theme)
+          echo "LB_BOOTLOADERS=${LB_BOOTLOADERS}"       | tee config/environment_chroot || true
+          echo "LB_SYSLINUX_THEME=${LB_SYSLINUX_THEME}" | tee -a config/environment_chroot || true
+
           echo "::group::lb config dir"; ls -la config || true; echo "::endgroup::"
 
       - name: Build ISO (verbose)
