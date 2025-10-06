@@ -1,10 +1,14 @@
-name: Remaster Debian Live ISO with Trezor Suite
+name: Remaster Fedora Live ISO with Trezor Suite (official path)
 
 on:
   workflow_dispatch:
     inputs:
+      fedora_major:
+        description: 'Fedora major version (e.g., 41). Leave empty for latest container.'
+        required: false
+        default: ""
       trezor_tag:
-        description: 'Optional: pin a specific Trezor Suite tag (e.g., v25.9.3). Leave empty for latest.'
+        description: 'Optional: Trezor Suite tag (e.g., v25.9.3). Empty = latest.'
         required: false
         default: ""
   schedule:
@@ -14,139 +18,94 @@ permissions:
   contents: read
 
 jobs:
-  remaster:
+  build-fedora-live:
+    # Run the whole job inside Fedora so we can use dnf + livecd-creator directly
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        shell: bash
+    container:
+      image: fedora:latest
+
     env:
-      SUITE: bookworm
-      ARCH: amd64
-      ISO_LABEL: DEBIAN_bookworm_TREZOR
-      ISO_BASENAME: debian-live-trezor
-      # SatoshiLabs 2021 Signing Key (MUST MATCH gpg [VALIDSIG] output)
-      TREZOR_FPR: "EB483B26B078A4AA1B6F425EE21B6950A2ECB65C"
-      TREZOR_KEY_URL: "https://trezor.io/security/satoshilabs-2021-signing-key.asc"
-      TREZOR_UDEV_URL: "https://data.trezor.io/udev/51-trezor.rules"
+      ISO_LABEL: FEDORA_TREZOR
+      ISO_BASENAME: fedora-live-trezor
+      # SatoshiLabs 2021 signing key (must match VALIDISG)
+      TREZOR_FPR: EB483B26B078A4AA1B6F425EE21B6950A2ECB65C
+      TREZOR_KEY_URL: https://trezor.io/security/satoshilabs-2021-signing-key.asc
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install remaster toolchain
+      - name: Install official live image toolchain
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            xorriso squashfs-tools genisoimage \
-            isolinux syslinux-common \
-            ca-certificates curl wget jq file \
-            gnupg dirmngr gpg-agent \
-            dosfstools mtools rsync \
-            qemu-utils || true
+          dnf -y update
+          # Official path per Fedora Quick Docs: livecd-creator + spin-kickstarts + ksflatten
+          dnf -y install livecd-tools spin-kickstarts pykickstart \
+                         xorriso isomd5sum squashfs-tools \
+                         jq curl gnupg2
+          rpm -E '%fedora' | tee FEDORA_VER.txt
 
-      - name: Pick and download current Debian live XFCE ISO (+ SHA256SUMS)
+      - name: Create Kickstart overlay (adds Trezor + AppImage fetch & verify)
         run: |
           set -euo pipefail
-          base="https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/"
-          html="$(curl -fsSL "$base")"
-          ISO_NAME="$(echo "$html" | grep -oE 'debian-live-[0-9.]+-amd64-xfce\.iso' | head -n1)"
-          test -n "$ISO_NAME" || { echo "Could not detect Debian live XFCE ISO"; exit 10; }
-          echo "Selected ISO: $ISO_NAME"
+          FEDORA_VER=$(cat FEDORA_VER.txt)
+          TREZOR_TAG="${{ github.event.inputs.trezor_tag }}"
 
-          curl -fsSLo "$ISO_NAME"        "${base}${ISO_NAME}"
-          curl -fsSLo SHA256SUMS         "${base}SHA256SUMS"
-          curl -fsSLo SHA256SUMS.sign    "${base}SHA256SUMS.sign" || true
+          cat > trezor-overlay.ks <<'KS'
+          # Include the official Workstation live configuration (Fedora 21+)
+          %include /usr/share/spin-kickstarts/fedora-live-workstation.ks
 
-          # Verify ISO via SHA256SUMS (checksum integrity)
-          grep " ${ISO_NAME}\$" SHA256SUMS | sha256sum -c -
+          # Ensure tools we need inside the image
+          %packages
+          # udev rules for Trezor (official Fedora package)
+          trezor-common
+          # AppImage needs FUSE v2 (libfuse.so.2) on Fedora -> fuse-libs provides it
+          fuse-libs
+          # fetch/verify helpers used in %post
+          curl
+          jq
+          gnupg2
+          %end
 
-      - name: Inspect original ISO boot params (for logs / troubleshooting)
-        run: |
+          %post --log=/root/trezor-post.log
           set -euo pipefail
-          xorriso -indev "${ISO_NAME}" -report_el_torito cmd   | tee xorriso-eltorito.txt
-          xorriso -indev "${ISO_NAME}" -boot_image any show_status | tee xorriso-boot-status.txt
 
-      - name: Mount & extract ISO contents
-        run: |
-          set -euo pipefail
-          sudo mkdir -p /mnt/iso
-          sudo mount -o loop,ro -t iso9660 "${ISO_NAME}" /mnt/iso
-          mkdir -p iso
-          rsync -aH --exclude=TRANS.TBL /mnt/iso/ iso/
-          sudo umount /mnt/iso
+          TREZOR_TAG="@TREZOR_TAG@"
+          TREZOR_KEY_URL="@TREZOR_KEY_URL@"
+          TREZOR_FPR="@TREZOR_FPR@"
 
-      - name: Unsquash live filesystem
-        run: |
-          set -euo pipefail
-          test -f iso/live/filesystem.squashfs || { echo "filesystem.squashfs missing"; exit 11; }
-          rm -rf squashfs-root
-          unsquashfs iso/live/filesystem.squashfs
+          mkdir -p /opt/trezor
+          cd /opt/trezor
 
-      - name: Fetch latest (or pinned) Trezor Suite AppImage + signature
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="${{ github.event.inputs.trezor_tag }}"
-          API="https://api.github.com/repos/trezor/trezor-suite/releases"
-          URL=${TAG:+$API/tags/${TAG}}
-          URL=${URL:-$API/latest}
-          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
-               -H "Accept: application/vnd.github+json" \
-               -H "X-GitHub-Api-Version: 2022-11-28" \
-               "$URL" -o release.json
+          # Import SatoshiLabs signing key
+          curl -fsSL "$TREZOR_KEY_URL" -o trezor.asc
+          gpg2 --batch --import trezor.asc || gpg --batch --import trezor.asc
 
-          APP_ID=$(jq -r '.assets[] | select(.name|test("AppImage$")) | .id' release.json | head -n1)
-          ASC_ID=$(jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .id' release.json | head -n1)
-          test -n "$APP_ID" && test -n "$ASC_ID" || { echo "AppImage/.asc not found"; jq -r '.assets[]?.name' release.json; exit 12; }
+          # Pick release (latest or pinned tag) and fetch AppImage + .asc
+          if [ -n "$TREZOR_TAG" ]; then
+            REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/${TREZOR_TAG}"
+          else
+            REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/latest"
+          fi
 
-          dl() {
-            local id="$1" out="$2"
-            curl -fsSLo "$out" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/octet-stream" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/trezor/trezor-suite/releases/assets/${id}"
-          }
-          dl "$APP_ID" trezor-suite.AppImage
-          dl "$ASC_ID" trezor-suite.AppImage.asc
+          curl -fsSL "$REL_API" -o /tmp/release.json
+          APP_URL=$(jq -r '.assets[] | select(.name|test("linux.*AppImage$")) | .browser_download_url' /tmp/release.json | head -n1)
+          ASC_URL=$(jq -r '.assets[] | select(.name|test("linux.*AppImage.asc$")) | .browser_download_url' /tmp/release.json | head -n1)
+          [ -n "$APP_URL" ] && [ -n "$ASC_URL" ] || { echo "Could not locate AppImage or .asc in release assets"; exit 12; }
+
+          curl -fsSLo trezor-suite.AppImage "$APP_URL"
+          curl -fsSLo trezor-suite.AppImage.asc "$ASC_URL"
           chmod +x trezor-suite.AppImage
 
-      - name: Verify Trezor Suite signature (pinned fingerprint)
-        run: |
-          set -euo pipefail
-          export GNUPGHOME="$PWD/gnupg"
-          mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-          # Import SatoshiLabs 2021 signing key from trezor.io
-          curl -fsSL "${TREZOR_KEY_URL}" -o trezor.asc
-          gpg --batch --import trezor.asc
+          # Verify signature and *pin* the fingerprint
+          gpg2 --batch --status-fd=1 --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
+            1> /tmp/gpg-status.log 2> /tmp/gpg-stderr.log || true
+          SIG_FPR=$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' /tmp/gpg-status.log)
+          [ -n "$SIG_FPR" ] && [ "$SIG_FPR" = "$TREZOR_FPR" ] || { echo "Signature fingerprint mismatch: $SIG_FPR"; exit 14; }
 
-          # Verify and parse status
-          gpg --status-fd=1 --batch --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
-            1> gpg-status.log 2> gpg-stderr.log || true
-
-          GOODSIG=$(awk 'BEGIN{c=0} /^\[GNUPG:\] GOODSIG /{c++} END{print c}' gpg-status.log)
-          SIG_FPR=$(awk '/^\[GNUPG:\] VALIDSIG /{print $3; exit}' gpg-status.log)
-          echo "GOODSIG count: ${GOODSIG:-0}"
-          echo "VALIDSIG fingerprint: ${SIG_FPR:-missing}"
-
-          [[ "${GOODSIG:-0}" -ge 1 && -n "$SIG_FPR" && "$SIG_FPR" == "$TREZOR_FPR" ]] || {
-            echo "Signature failed or fingerprint mismatch"; exit 13; }
-
-      - name: Inject Trezor Suite, udev rules, desktop entry
-        run: |
-          set -euo pipefail
-          # AppImage + permissions
-          install -d "squashfs-root/opt/trezor"
-          install -m0755 trezor-suite.AppImage "squashfs-root/opt/trezor/trezor-suite.AppImage"
-
-          # udev rules (official)
-          curl -fsSL "${TREZOR_UDEV_URL}" -o "squashfs-root/etc/udev/rules.d/51-trezor.rules"
-
-          # Desktop launcher
-          install -d "squashfs-root/usr/share/applications"
-          cat > "squashfs-root/usr/share/applications/trezor-suite.desktop" <<'EOF'
+          # Desktop entry
+          install -d /usr/share/applications
+          cat > /usr/share/applications/trezor-suite.desktop <<'EOF'
           [Desktop Entry]
           Name=Trezor Suite
           Comment=Manage your Trezor hardware wallet
@@ -156,74 +115,50 @@ jobs:
           Categories=Finance;Utility;
           EOF
 
-      - name: Chroot to install libfuse2 (AppImage requirement)
+          # udev rules come from trezor-common; ensure udev reload will succeed at runtime
+          # (udev will pick rules automatically on a running system)
+          %end
+          KS
+
+          # Inject runtime values
+          sed -i \
+            -e "s|@TREZOR_TAG@|${TREZOR_TAG}|g" \
+            -e "s|@TREZOR_KEY_URL@|${TREZOR_KEY_URL}|g" \
+            -e "s|@TREZOR_FPR@|${TREZOR_FPR}|g" \
+            trezor-overlay.ks
+
+          # Optional: validate syntax
+          ksvalidator trezor-overlay.ks
+
+      - name: Flatten Kickstart (per docs) and build ISO with livecd-creator
         run: |
           set -euo pipefail
-          sudo mount --bind /dev  squashfs-root/dev
-          sudo mount --bind /sys  squashfs-root/sys
-          sudo mount --bind /proc squashfs-root/proc
-          sudo cp /etc/resolv.conf squashfs-root/etc/resolv.conf
+          FEDORA_VER=$(cat FEDORA_VER.txt)
+          # Flatten any %include into a single ks as Quick Docs show
+          ksflatten -c trezor-overlay.ks -o trezor-flat.ks
 
-          sudo chroot squashfs-root /bin/bash -c '
-            set -e
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y --no-install-recommends libfuse2 ca-certificates
-            apt-get clean
-            rm -rf /var/lib/apt/lists/*
-          '
+          # Build the ISO (this needs root; we're root in the Fedora container)
+          livecd-creator --verbose \
+            --config=trezor-flat.ks \
+            --fslabel="${ISO_LABEL}" \
+            --releasever="${FEDORA_VER}" \
+            --cache=/var/cache/live
 
-          sudo umount squashfs-root/proc || true
-          sudo umount squashfs-root/sys  || true
-          sudo umount squashfs-root/dev  || true
+          # Find the resulting ISO and rename consistently
+          ISO="$(ls -1 *.iso | head -n1)"
+          test -n "$ISO"
+          OUT="${ISO_BASENAME}-F${FEDORA_VER}-x86_64.iso"
+          mv "$ISO" "$OUT"
+          sha256sum "$OUT" | tee "$OUT.sha256"
 
-      - name: Repack filesystem.squashfs
-        run: |
-          set -euo pipefail
-          mv iso/live/filesystem.squashfs iso/live/filesystem.squashfs.bak
-          mksquashfs squashfs-root iso/live/filesystem.squashfs -noappend -comp xz
-
-      - name: Regenerate md5sum.txt inside ISO tree
-        run: |
-          set -euo pipefail
-          cd iso
-          # Create new md5sum.txt excluding itself
-          find . -type f -print0 | sort -z | xargs -0 md5sum | grep -vE '\./md5sum\.txt$' > md5sum.txt
-          cd -
-
-      - name: Build bootable ISO (BIOS+UEFI) with xorriso
-        run: |
-          set -euo pipefail
-          OUT="${ISO_BASENAME}-${SUITE}-${ARCH}.iso"
-          xorriso -as mkisofs \
-            -r -J -joliet-long -l -iso-level 3 \
-            -V "${ISO_LABEL}" \
-            -A "Debian Live (Trezor Suite)" \
-            -o "${OUT}" \
-            -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
-            -c isolinux/boot.cat \
-            -b isolinux/isolinux.bin \
-              -no-emul-boot -boot-load-size 4 -boot-info-table \
-            -eltorito-alt-boot \
-              -e boot/grub/efi.img \
-              -no-emul-boot -isohybrid-gpt-basdat \
-            iso
-
-          sha256sum "${OUT}" | tee "${OUT}.sha256"
-
-      - name: Upload artifacts (ISO + logs)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: trezor-debian-iso-and-logs
+          name: trezor-fedora-iso-and-logs
           path: |
             *.iso
             *.iso.sha256
-            gpg-status.log
-            gpg-stderr.log
-            xorriso-eltorito.txt
-            xorriso-boot-status.txt
-            SHA256SUMS
-            release.json
-          if-no-files-found: warn
+            trezor-overlay.ks
+            trezor-flat.ks
+            FEDORA_VER.txt
           retention-days: 14
