@@ -11,6 +11,8 @@ on:
         description: 'Optional Trezor Suite tag (e.g., v25.9.3). Empty = latest.'
         required: false
         default: ""
+  schedule:
+    - cron: "0 8 1 * *" # monthly
 
 permissions:
   contents: read
@@ -41,6 +43,7 @@ jobs:
             -v /dev:/dev \
             "${IMG}" bash -lc '
               set -euo pipefail
+
               dnf -y install lorax lorax-lmc-novirt pykickstart anaconda-tui git jq curl gnupg2 ca-certificates xorriso
 
               FEDORA_VER=$(rpm -E %fedora)
@@ -48,11 +51,21 @@ jobs:
               REPO="https://download.fedoraproject.org/pub/fedora/linux/releases/${FEDORA_VER}/Everything/x86_64/os/"
 
               git clone --depth 1 https://pagure.io/fedora-kickstarts.git
-              cd fedora-kickstarts || exit 1
-              KSDIR=$PWD
-              cd ..
+              cd fedora-kickstarts
+              REM="f${FEDORA_VER}"
+              if git ls-remote --heads origin "$REM" | grep -q "$REM"; then
+                git fetch --depth=1 origin "refs/heads/${REM}:refs/heads/${REM}"
+                git switch "$REM"
+              else
+                echo "Branch $REM not found; staying on default branch."
+              fi
+              KSDIR="$PWD"
+              cd -
 
-              cat > trezor-overlay.ks <<KS
+              # Define OUT early so it is bound
+              OUT="${ISO_BASENAME}-F${FEDORA_VER}-x86_64.iso"
+
+              cat > trezor-overlay.ks <<'KS'
               %include ${KSDIR}/fedora-live-workstation.ks
               
               %packages
@@ -66,39 +79,58 @@ jobs:
               
               %post --log=/root/trezor-post.log
               set -euo pipefail
-              TREZOR_TAG="\${TREZOR_TAG:-}"
+              
+              TREZOR_TAG="${TREZOR_TAG:-}"
               TREZOR_KEY_URL="${TREZOR_KEY_URL}"
               TREZOR_FPR="${TREZOR_FPR}"
+              
               mkdir -p /opt/trezor
               cd /opt/trezor
-              curl -fsSL "\$TREZOR_KEY_URL" -o trezor.asc
+              
+              curl -fsSL "$TREZOR_KEY_URL" -o trezor.asc
               gpg2 --batch --import trezor.asc || gpg --batch --import trezor.asc
-              if [ -n "\$TREZOR_TAG" ]; then
-                REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/\$TREZOR_TAG"
+              
+              if [ -n "$TREZOR_TAG" ]; then
+                REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/$TREZOR_TAG"
               else
                 REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/latest"
               fi
-              curl -fsSL "\$REL_API" -o /tmp/release.json
-              APP_URL=\$(jq -r ".assets[] | select(.name|test(\\"linux.*AppImage\$\\") ) | .browser_download_url" /tmp/release.json | head -n1)
-              ASC_URL=\$(jq -r ".assets[] | select(.name|test(\\"linux.*AppImage.asc\$\\") ) | .browser_download_url" /tmp/release.json | head -n1)
-              curl -fsSLo trezor-suite.AppImage "\$APP_URL"
-              curl -fsSLo trezor-suite.AppImage.asc "\$ASC_URL"
+              curl -fsSL "$REL_API" -o /tmp/release.json
+              
+              APP_URL=$(jq -r ".assets[] | select(.name|test(\\"linux.*AppImage$\\") ) | .browser_download_url" /tmp/release.json | head -n1)
+              ASC_URL=$(jq -r ".assets[] | select(.name|test(\\"linux.*AppImage.asc$\\") ) | .browser_download_url" /tmp/release.json | head -n1)
+              [ -n "$APP_URL" ] && [ -n "$ASC_URL" ] || { echo "Trezor Suite AppImage or asc not found"; exit 20; }
+              
+              curl -fsSLo trezor-suite.AppImage "$APP_URL"
+              curl -fsSLo trezor-suite.AppImage.asc "$ASC_URL"
               chmod +x trezor-suite.AppImage
+              
+              gpg2 --batch --status-fd=1 --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
+                1> /tmp/gpg-status.log 2> /tmp/gpg-stderr.log || true
+              SIG_FPR=$(awk "/^\[GNUPG:\] VALIDSIG /{print \$3; exit}" /tmp/gpg-status.log)
+              [ -n "$SIG_FPR" ] && [ "$SIG_FPR" = "$TREZOR_FPR" ] || { echo "Signature mismatch: $SIG_FPR"; exit 21; }
+              
               install -d /usr/share/applications
               cat > /usr/share/applications/trezor-suite.desktop <<EOF
               [Desktop Entry]
               Name=Trezor Suite
+              Comment=Manage your Trezor hardware wallet
               Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
               Terminal=false
               Type=Application
               Categories=Finance;Utility;
               EOF
+              
               %end
               KS
 
+              # Replace placeholders with real values
+              sed -i \
+                -e "s|${KSDIR}/fedora-live-workstation.ks|${KSDIR}/fedora-live-workstation.ks|g" \
+                trezor-overlay.ks
+
               ksflatten -c trezor-overlay.ks -o trezor-flat.ks
 
-              OUT="fedora-live-trezor-F${FEDORA_VER}-x86_64.iso"
               livemedia-creator \
                 --ks trezor-flat.ks \
                 --no-virt \
