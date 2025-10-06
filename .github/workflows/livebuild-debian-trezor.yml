@@ -28,14 +28,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
+      
       - name: Build in a privileged Fedora container (lorax + pykickstart)
         run: |
           set -euo pipefail
           FED="${{ github.event.inputs.fedora_major }}"
           IMG="fedora:${FED:-latest}"
-
-          # Run privileged so lmc can use loop + mounts
+      
           docker run --rm --privileged \
             -e ISO_LABEL="${ISO_LABEL}" \
             -e ISO_BASENAME="${ISO_BASENAME}" \
@@ -44,29 +43,33 @@ jobs:
             -e TREZOR_TAG="${{ github.event.inputs.trezor_tag }}" \
             -v "$PWD":/workspace -w /workspace "${IMG}" bash -lc '
               set -euo pipefail
-
+      
               dnf -y update
-              # Official toolchain: Lorax (livemedia-creator), pykickstart (ksflatten), git, etc.
-              dnf -y install lorax-lmc-novirt pykickstart git jq curl gnupg2 ca-certificates xorriso
-
+              # Official toolchain: Lorax (livemedia-creator), pykickstart, git, etc.
+              dnf -y install lorax lorax-lmc-novirt pykickstart anaconda-tui \
+                             git jq curl gnupg2 ca-certificates xorriso
+      
               FEDORA_VER=$(rpm -E %fedora)
               echo "Fedora detected: $FEDORA_VER"
-
-              # Get kickstarts from Pagure (spin-kickstarts RPM is not available on F42+)
+      
+              # Get kickstarts from Pagure
               git clone --depth 1 https://pagure.io/fedora-kickstarts.git
               cd fedora-kickstarts
-              if git ls-remote --exit-code --heads origin "f${FEDORA_VER}" >/dev/null 2>&1; then
-                git fetch origin "f${FEDORA_VER}" && git checkout "f${FEDORA_VER}"
+              REM="f${FEDORA_VER}"
+              if git ls-remote --heads origin "$REM" | grep -q "$REM"; then
+                # fetch the remote branch and create a local branch from it
+                git fetch --depth=1 origin "refs/heads/${REM}:refs/heads/${REM}"
+                git switch "$REM"
               else
-                echo "Branch f${FEDORA_VER} not found; using main."
+                echo "Branch $REM not found; using $(git rev-parse --abbrev-ref HEAD) (usually main)."
               fi
-              KSDIR="$(pwd)"
+              KSDIR="$PWD"
               cd -
-
-              # Create our overlay kickstart that includes Workstation base, adds trezor + AppImage install in %post
+      
+              # Our overlay kickstart
               cat > trezor-overlay.ks <<KS
               %include ${KSDIR}/fedora-live-workstation.ks
-
+      
               %packages
               trezor-common
               fuse-libs
@@ -75,39 +78,39 @@ jobs:
               gnupg2
               ca-certificates
               %end
-
+      
               %post --log=/root/trezor-post.log
               set -euo pipefail
               TREZOR_TAG="${TREZOR_TAG:-}"
               TREZOR_KEY_URL="${TREZOR_KEY_URL}"
               TREZOR_FPR="${TREZOR_FPR}"
-
+      
               mkdir -p /opt/trezor
               cd /opt/trezor
-
-              curl -fsSL "\$TREZOR_KEY_URL" -o trezor.asc
+      
+              curl -fsSL "$TREZOR_KEY_URL" -o trezor.asc
               gpg2 --batch --import trezor.asc || gpg --batch --import trezor.asc
-
-              if [ -n "\$TREZOR_TAG" ]; then
-                REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/\$TREZOR_TAG"
+      
+              if [ -n "$TREZOR_TAG" ]; then
+                REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/$TREZOR_TAG"
               else
                 REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/latest"
               fi
-              curl -fsSL "\$REL_API" -o /tmp/release.json
-
-              APP_URL=\$(jq -r '\''.assets[] | select(.name|test("linux.*AppImage$")) | .browser_download_url'\'' /tmp/release.json | head -n1)
-              ASC_URL=\$(jq -r '\''.assets[] | select(.name|test("linux.*AppImage.asc$")) | .browser_download_url'\'' /tmp/release.json | head -n1)
-              [ -n "\$APP_URL" ] && [ -n "\$ASC_URL" ] || { echo "Trezor Suite AppImage/.asc not found"; exit 20; }
-
-              curl -fsSLo trezor-suite.AppImage "\$APP_URL"
-              curl -fsSLo trezor-suite.AppImage.asc "\$ASC_URL"
+              curl -fsSL "$REL_API" -o /tmp/release.json
+      
+              APP_URL=$(jq -r ".assets[] | select(.name|test(\"linux.*AppImage$\")) | .browser_download_url" /tmp/release.json | head -n1)
+              ASC_URL=$(jq -r ".assets[] | select(.name|test(\"linux.*AppImage.asc$\")) | .browser_download_url" /tmp/release.json | head -n1)
+              [ -n "$APP_URL" ] && [ -n "$ASC_URL" ] || { echo "Trezor Suite AppImage/.asc not found"; exit 20; }
+      
+              curl -fsSLo trezor-suite.AppImage "$APP_URL"
+              curl -fsSLo trezor-suite.AppImage.asc "$ASC_URL"
               chmod +x trezor-suite.AppImage
-
+      
               gpg2 --batch --status-fd=1 --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
                 1> /tmp/gpg-status.log 2> /tmp/gpg-stderr.log || true
-              SIG_FPR=\$(awk '\''/^\[GNUPG:\] VALIDSIG /{print $3; exit}'\'' /tmp/gpg-status.log)
-              [ -n "\$SIG_FPR" ] && [ "\$SIG_FPR" = "\$TREZOR_FPR" ] || { echo "Signature fingerprint mismatch: \$SIG_FPR"; exit 21; }
-
+              SIG_FPR=$(awk "/^\\[GNUPG:\\] VALIDSIG /{print \$3; exit}" /tmp/gpg-status.log)
+              [ -n "$SIG_FPR" ] && [ "$SIG_FPR" = "$TREZOR_FPR" ] || { echo "Signature fingerprint mismatch: $SIG_FPR"; exit 21; }
+      
               install -d /usr/share/applications
               cat > /usr/share/applications/trezor-suite.desktop <<EOF
               [Desktop Entry]
@@ -120,11 +123,9 @@ jobs:
               EOF
               %end
               KS
-
-              # Flatten the kickstart (resolves all %include)
+      
+              # Flatten and build the Live ISO (official flow)
               ksflatten -c trezor-overlay.ks -o trezor-flat.ks
-
-              # Build Live ISO (no-virt path as per Fedora docs)
               OUT="${ISO_BASENAME}-F${FEDORA_VER}-x86_64.iso"
               livemedia-creator \
                 --ks trezor-flat.ks \
@@ -137,12 +138,13 @@ jobs:
                 --iso-name "${OUT}" \
                 --releasever "${FEDORA_VER}" \
                 --macboot
-
-              # Copy results back to workspace
+      
               cp -v /var/lmc/*.iso /workspace/ || :
               cd /workspace
               sha256sum "${OUT}" | tee "${OUT}.sha256"
             '
+
+
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
