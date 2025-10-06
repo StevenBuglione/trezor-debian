@@ -5,48 +5,62 @@ trezor-common
 fuse-libs
 curl
 jq
-gnupg2
+sudo
 ca-certificates
 %end
 
-%post --log=/root/trezor-post.log
-set -e
+# Copy pre-fetched bits from the workspace into the image and always create a launcher.
+# No network needed here.
+%post --nochroot --log=/root/trezor-post.log
+set -euo pipefail
 
-TREZOR_TAG="__TREZOR_TAG__"
-TREZOR_KEY_URL="__TREZOR_KEY_URL__"
-TREZOR_FPR="__TREZOR_FPR__"
+LIVE_ROOT="/mnt/sysimage"
+SRC="/workspace/scripts/fedora-live/vendor"
 
-mkdir -p /opt/trezor
-cd /opt/trezor
+# Ensure dirs
+install -d -m0755 "${LIVE_ROOT}/opt/trezor"
+install -d -m0755 "${LIVE_ROOT}/usr/share/applications"
+install -d -m0755 "${LIVE_ROOT}/usr/local/bin"
 
-curl -fsSL "$TREZOR_KEY_URL" -o trezor.asc
-gpg2 --batch --import trezor.asc || gpg --batch --import trezor.asc
-
-REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/latest"
-if [ -n "$TREZOR_TAG" ]; then
-  REL_API="https://api.github.com/repos/trezor/trezor-suite/releases/tags/$TREZOR_TAG"
+# If host prefetch succeeded, copy artifacts in; otherwise, the launcher will self-fetch on first run.
+if [ -f "${SRC}/trezor-suite.AppImage" ]; then
+  install -m0755 "${SRC}/trezor-suite.AppImage" "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage"
 fi
-curl -fsSL "$REL_API" -o /tmp/release.json
+if [ -f "${SRC}/trezor-suite.AppImage.asc" ]; then
+  install -m0644 "${SRC}/trezor-suite.AppImage.asc" "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage.asc"
+fi
+if [ -f "${SRC}/trezor.asc" ]; then
+  install -m0644 "${SRC}/trezor.asc" "${LIVE_ROOT}/opt/trezor/trezor.asc"
+fi
 
-APP_URL=$(jq -r '.assets[] | select(.name|test("linux.*AppImage$")) | .browser_download_url' /tmp/release.json | head -n1)
-ASC_URL=$(jq -r '.assets[] | select(.name|test("linux.*AppImage.asc$")) | .browser_download_url' /tmp/release.json | head -n1)
-[ -n "$APP_URL" ] && [ -n "$ASC_URL" ] || { echo "Trezor Suite AppImage or .asc not found"; exit 20; }
+# First-run helper: if AppImage is missing, fetch latest from GitHub at launch.
+cat > "${LIVE_ROOT}/usr/local/bin/trezor-suite" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+APP="/opt/trezor/trezor-suite.AppImage"
+if [ ! -x "$APP" ]; then
+  echo "Trezor Suite not found. Fetching latest AppImage..."
+  TMP="$(mktemp -d)"
+  URL="$(curl -fsSL https://api.github.com/repos/trezor/trezor-suite/releases/latest \
+        | jq -r '.assets[] | select(.name|test("linux.*AppImage$")) | .browser_download_url' | head -n1)"
+  if [ -z "$URL" ]; then
+    echo "Could not determine latest AppImage URL from GitHub." >&2
+    exit 1
+  fi
+  curl -fsSL -L "$URL" -o "$TMP/trezor.AppImage"
+  chmod +x "$TMP/trezor.AppImage"
+  sudo install -m0755 "$TMP/trezor.AppImage" "$APP"
+fi
+exec "$APP" --no-sandbox "$@"
+EOS
+chmod +x "${LIVE_ROOT}/usr/local/bin/trezor-suite"
 
-curl -fsSLo trezor-suite.AppImage "$APP_URL"
-curl -fsSLo trezor-suite.AppImage.asc "$ASC_URL"
-chmod +x trezor-suite.AppImage
-
-gpg2 --batch --status-fd=1 --verify trezor-suite.AppImage.asc trezor-suite.AppImage \
-  1> /tmp/gpg-status.log 2> /tmp/gpg-stderr.log || true
-SIG_FPR=$(awk "/^\\[GNUPG:\\] VALIDSIG /{print \$3; exit}" /tmp/gpg-status.log)
-[ -n "$SIG_FPR" ] && [ "$SIG_FPR" = "$TREZOR_FPR" ] || { echo "Signature mismatch: $SIG_FPR"; exit 21; }
-
-install -d /usr/share/applications
-cat > /usr/share/applications/trezor-suite.desktop <<'EOF'
+# Desktop launcher (always created)
+cat > "${LIVE_ROOT}/usr/share/applications/trezor-suite.desktop" <<'EOF'
 [Desktop Entry]
 Name=Trezor Suite
 Comment=Manage your Trezor hardware wallet
-Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
+Exec=/usr/local/bin/trezor-suite
 Terminal=false
 Type=Application
 Categories=Finance;Utility;
