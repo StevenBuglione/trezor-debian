@@ -1,6 +1,10 @@
 # ==== Base: minimal live (no browsers) ====
 %include __KSDIR__/fedora-live-minimization.ks
 
+# REQUIRED by livemedia-creator --no-virt:
+url --metalink="https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever&arch=$basearch"
+repo --name=updates --metalink="https://mirrors.fedoraproject.org/metalink?repo=updates-released-f$releasever&arch=$basearch"
+
 # ==== Users / auth / services ====
 rootpw --lock
 user --name=trezor --groups=wheel --homedir=/home/trezor --shell=/bin/bash --lock
@@ -11,7 +15,7 @@ firstboot --disable
 
 # Display manager & graphical login
 services --enabled="sddm" --disabled="sshd,NetworkManager-wait-online,avahi-daemon,cups,ModemManager"
-xconfig --startxonboot   # (valid kickstart directive; don't try defaultdesktop=lxqt)
+xconfig --startxonboot
 
 # ==== Packages: minimal LXQt Wayland + Trezor ====
 %packages
