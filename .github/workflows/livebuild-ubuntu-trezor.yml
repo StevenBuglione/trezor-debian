@@ -33,7 +33,7 @@ jobs:
       UBUNTU_MIRROR: "http://archive.ubuntu.com/ubuntu/"
       UBUNTU_SECURITY: "http://security.ubuntu.com/ubuntu/"
 
-      # GitHub repo for trezor-suite
+      # trezor-suite repo
       GH_OWNER: "trezor"
       GH_REPO: "trezor-suite"
 
@@ -47,7 +47,7 @@ jobs:
       - name: Runner info (debug trap enabled)
         run: |
           set -Eeuo pipefail
-          trap 'CODE=$?; echo "::group::DEBUG FAIL CONTEXT"; echo "Exit: $CODE"; echo "PWD: $(pwd)"; echo "Tree (top):"; find -maxdepth 3 -type d -printf "%p\n" || true; echo "Files under config/: "; find config -type f -maxdepth 4 -print 2>/dev/null || true; echo "::endgroup::"; exit $CODE' ERR
+          trap 'CODE=$?; echo "::group::DEBUG FAIL CONTEXT"; echo "Exit: $CODE"; echo "PWD: $(pwd)"; echo "Tree (top dirs):"; find -maxdepth 3 -type d -printf "%p\n" || true; echo "Files under config/: "; find config -type f -maxdepth 4 -print 2>/dev/null || true; echo "::endgroup::"; exit $CODE' ERR
           uname -a || true
           lsb_release -a || true
           df -h || true
@@ -74,22 +74,24 @@ jobs:
           CODENAME="${{ github.event.inputs.ubuntu_codename || 'jammy' }}"
           DISABLE_NET="${{ github.event.inputs.disable_network_by_default == 'true' && 'true' || 'false' }}"
           TAG_INPUT="${{ github.event.inputs.trezor_tag }}"
-          echo "CODENAME=$CODENAME"      >> "$GITHUB_OUTPUT"
-          echo "DISABLE_NET=$DISABLE_NET" >> "$GITHUB_OUTPUT"
-          echo "VOL=UBUNTU_${CODENAME}_TREZOR" >> "$GITHUB_OUTPUT"
-          echo "TAG_INPUT=$TAG_INPUT" >> "$GITHUB_OUTPUT"
+          echo "CODENAME=$CODENAME"                >> "$GITHUB_OUTPUT"
+          echo "DISABLE_NET=$DISABLE_NET"          >> "$GITHUB_OUTPUT"
+          echo "VOL=UBUNTU_${CODENAME}_TREZOR"     >> "$GITHUB_OUTPUT"
+          echo "TAG_INPUT=$TAG_INPUT"              >> "$GITHUB_OUTPUT"
 
       - name: Clean & create config dirs
         run: |
           set -euxo pipefail
           sudo lb clean || true
-          rm -rf config build-cache logs || true
+          rm -rf config build-cache logs gnupg || true
           mkdir -p config/includes.chroot/opt/trezor
           mkdir -p config/includes.chroot/usr/share/applications
           mkdir -p config/includes.chroot/etc/udev/rules.d
           mkdir -p config/package-lists
           mkdir -p config/hooks/normal
           mkdir -p logs
+          # dedicated keyring just for this workflow run to avoid pollution
+          mkdir -p gnupg && chmod 700 gnupg
 
       # ---- Write files in separate steps (avoid heredoc pitfalls) ----
       - name: Write package list (base.list.chroot)
@@ -175,7 +177,7 @@ jobs:
             api_url="https://api.github.com/repos/${owner}/${repo}/releases/latest"
           fi
 
-          # Use auth header to avoid rate limits
+          # Auth header to avoid rate limits
           curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" "$api_url" -o release.json
 
           echo "::group::Release metadata"
@@ -203,11 +205,13 @@ jobs:
 
       # ---- Import SatoshiLabs 2021 signing key from trezor.io over HTTPS (no keyservers) ----
       - name: Import Trezor public key (HTTPS from trezor.io)
+        env:
+          GNUPGHOME: ${{ github.workspace }}/gnupg
         run: |
           set -euxo pipefail
           mkdir -p build-cache/keys
 
-          # Primary URL (official domain). If they change the path, we try a couple of alternates for resilience.
+          # Primary (official) URLs — try a few common paths in case they adjust the filename
           urls=(
             "https://trezor.io/security/satoshilabs-2021-signing-key.asc"
             "https://trezor.io/security/satoshilabs-2021-signing-key.txt"
@@ -232,10 +236,14 @@ jobs:
 
           gpg --import build-cache/keys/trezor.asc
 
+      # ---- Corrected parser: verify signature and match fingerprint to imported key ----
       - name: Verify AppImage signature (issuer must equal imported key)
+        env:
+          GNUPGHOME: ${{ github.workspace }}/gnupg
         run: |
           set -euxo pipefail
-          # Extract the imported key's fingerprint (first fpr line)
+
+          # Extract the imported key's fingerprint (from this dedicated GNUPGHOME)
           IMPORTED_FPR="$(gpg --with-colons --fingerprint | awk -F: '/^fpr:/{print $10; exit}')"
           if [ -z "$IMPORTED_FPR" ]; then
             echo "No imported key fingerprint found"; exit 3
@@ -248,14 +256,17 @@ jobs:
             2> >(tee logs/gpg-stderr.log >&2) \
             | tee logs/gpg-status.log
 
-          SIG_GOOD="$(awk '/^\[GNUPG:\] GOODSIG /{c++} END{print c+0}' logs/gpg-status.log)"
-          SIG_FPR="$(awk '/^\[GNUPG:\] VALIDSIG /{print $10; exit}' logs/gpg-status.log || true)"
+          # Parse status (FIXED: VALIDSIG fingerprint is field #2)
+          SIG_GOOD="$(awk 'BEGIN{c=0} /^\[GNUPG:\] GOODSIG /{c++} END{print c}' logs/gpg-status.log)"
+          SIG_FPR="$(awk '/^\[GNUPG:\] VALIDSIG /{print $2; exit}' logs/gpg-status.log)"
+          SIG_KEYID="$(awk '/^\[GNUPG:\] GOODSIG /{print $2; exit}' logs/gpg-status.log || true)"
 
-          if [ "$SIG_GOOD" -lt 1 ] || [ -z "$SIG_FPR" ]; then
-            echo "Signature not good or missing VALIDSIG line"; exit 4
-          fi
+          echo "GOODSIG count: ${SIG_GOOD:-0}"
+          echo "GOODSIG keyid: ${SIG_KEYID:-unknown}"
+          echo "VALIDSIG fingerprint: ${SIG_FPR:-missing}"
 
-          echo "Signature VALIDSIG fingerprint: $SIG_FPR"
+          [ "${SIG_GOOD:-0}" -ge 1 ] || { echo "Missing GOODSIG"; exit 4; }
+          [ -n "${SIG_FPR:-}" ]      || { echo "Missing VALIDSIG fingerprint"; exit 4; }
 
           # Enforce issuer == imported key (ties trust to trezor.io key over HTTPS)
           if [ "$SIG_FPR" != "$IMPORTED_FPR" ]; then
