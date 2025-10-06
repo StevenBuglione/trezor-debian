@@ -1,15 +1,15 @@
 # Base: official LXQt Live spin (pulls in live compose deps)
 %include __KSDIR__/fedora-live-lxqt.ks
 
-# Users / auth
+# Users / auth (use the spin's default liveuser for reliable boot/login)
 rootpw --lock
-user --name=trezor --groups=wheel --homedir=/home/trezor --shell=/bin/bash --lock
 firstboot --disable
 selinux --enforcing
 firewall --disabled
 
-# Extra packages we need in addition to the spin
+# Extra packages we need (and explicit removals)
 %packages
+# Needed for Trezor + helpers
 trezor-common
 fuse-libs
 curl
@@ -17,135 +17,123 @@ jq
 sudo
 ca-certificates
 rsync
-# Ensure Wayland session & miriway default are present
+
+# Wayland session + Xwayland shim
 lxqt-wayland-session
 lxqt-wayland-session-default-compositor-miriway
 xorg-x11-server-Xwayland
+
+# Theming + file manager for desktop/wallpaper
+breeze-icon-theme
+pcmanfm-qt
+lxqt-config
+
+# Purge browsers and obvious extras (keep this list lean)
+-firefox
+-chromium
+-falkon
+-lynx
+-w3m
+-transmission
+-epiphany
+-enki
+-lximage-qt
+
+-konqueror
+-qupzilla
+# (You can add more -pkgs here as you discover them)
 %end
 
-# Host-side post: copy artifacts if prefetched, add wrapper+desktop, autologin
+# Host-side post: copy artifacts, bundle scripts, set themes/wallpaper (no network)
 %post --nochroot --log=/root/trezor-post.log
 set -euo pipefail
 
 LIVE_ROOT="/mnt/sysimage"
 SRC_VENDOR="/workspace/scripts/fedora-live/vendor"
 SRC_SCRIPTS="/workspace/trezor-scripts"
+SRC_THEME="/workspace/themes/Arch-Colors"
+SRC_IMG_DIR="/workspace/images"
 
-# SDDM autologin to LXQt Wayland
-install -d -m0755 "${LIVE_ROOT}/etc/sddm.conf.d"
-cat > "${LIVE_ROOT}/etc/sddm.conf.d/10-autologin.conf" <<'EOF'
-[Autologin]
-User=trezor
-Session=lxqt-wayland.desktop
-EOF
-
-# Dirs
+# Ensure dirs
 install -d -m0755 "${LIVE_ROOT}/opt/trezor" \
                    "${LIVE_ROOT}/opt/trezor-scripts" \
                    "${LIVE_ROOT}/usr/share/applications" \
                    "${LIVE_ROOT}/usr/local/bin" \
-                   "${LIVE_ROOT}/etc/xdg/autostart"
+                   "${LIVE_ROOT}/etc/xdg/autostart" \
+                   "${LIVE_ROOT}/etc/xdg/lxqt" \
+                   "${LIVE_ROOT}/usr/share/backgrounds/trezor"
 
 # If prefetched on the host, vendor them in (optional)
 [ -f "${SRC_VENDOR}/trezor-suite.AppImage" ]     && install -m0755 "${SRC_VENDOR}/trezor-suite.AppImage"     "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage"     || true
 [ -f "${SRC_VENDOR}/trezor-suite.AppImage.asc" ] && install -m0644 "${SRC_VENDOR}/trezor-suite.AppImage.asc" "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage.asc" || true
 [ -f "${SRC_VENDOR}/trezor.asc" ]                && install -m0644 "${SRC_VENDOR}/trezor.asc"                "${LIVE_ROOT}/opt/trezor/trezor.asc"                || true
 
-# Bundle repo scripts (no VCS junk)
+# Bundle YOUR repo scripts (exclude VCS junk), make executable
 if [ -d "${SRC_SCRIPTS}" ]; then
   rsync -a --delete --exclude ".git" --exclude ".github" --exclude ".gitmodules" --exclude "*.md" \
     "${SRC_SCRIPTS}/" "${LIVE_ROOT}/opt/trezor-scripts/"
   find "${LIVE_ROOT}/opt/trezor-scripts" -type f -name "*.sh" -exec chmod 0755 {} \;
 fi
 
-# First-run wrapper: fetch arch-correct AppImage if missing, then exec
-cat > "${LIVE_ROOT}/usr/local/bin/trezor-suite" <<'EOS'
-#!/usr/bin/env bash
-set -euo pipefail
-APP="/opt/trezor/trezor-suite.AppImage"
-
-if [ ! -x "$APP" ]; then
-  ARCH="$(uname -m)"
-  case "$ARCH" in
-    x86_64|amd64) RX='linux.*(x86_64|amd64|x64).*AppImage$' ;;
-    aarch64|arm64) RX='linux.*(aarch64|arm64).*AppImage$' ;;
-    armv7l|armv7|armhf) RX='linux.*(armv7|armhf).*AppImage$' ;;
-    *) RX='AppImage$' ;;
-  esac
-  echo "Trezor Suite missing. Fetching latest for $ARCH …"
-  URL="$(curl -fsSL https://api.github.com/repos/trezor/trezor-suite/releases/latest \
-        | jq -r --arg rx "$RX" '.assets[] | select(.name|test($rx)) | .browser_download_url' | head -n1)"
-  [ -n "$URL" ] || { echo "Could not determine AppImage URL for $ARCH." >&2; exit 1; }
-  TMP="$(mktemp)"
-  curl -fsSL -L "$URL" -o "$TMP"
-  sudo install -m0755 "$TMP" "$APP"
-  rm -f "$TMP"
-fi
-
-exec "$APP" --no-sandbox "$@"
-EOS
-chmod +x "${LIVE_ROOT}/usr/local/bin/trezor-suite"
-
-# Desktop launcher
-cat > "${LIVE_ROOT}/usr/share/applications/trezor-suite.desktop" <<'EOF'
+# Desktop launcher for Trezor Suite (assumes AppImage is embedded by CI)
+if [ -x "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage" ]; then
+  cat > "${LIVE_ROOT}/usr/share/applications/trezor-suite.desktop" <<'EOF'
 [Desktop Entry]
 Name=Trezor Suite
 Comment=Manage your Trezor hardware wallet
-Exec=/usr/local/bin/trezor-suite
+Exec=/opt/trezor/trezor-suite.AppImage --no-sandbox
 Terminal=false
 Type=Application
 Categories=Finance;Utility;
 EOF
+fi
 
-# Optional: autostart Trezor at login
-cat > "${LIVE_ROOT}/etc/xdg/autostart/trezor-suite.desktop" <<'EOF'
-[Desktop Entry]
-Name=Trezor Suite (Auto)
-Exec=/usr/local/bin/trezor-suite
-Type=Application
-X-GNOME-Autostart-enabled=true
+# ----------------------------
+# Theming: Breeze Dark + Arch-Colors
+# ----------------------------
+# 1) Copy Arch-Colors LXQt theme from your repo if present
+if [ -d "${SRC_THEME}" ]; then
+  rsync -a "${SRC_THEME}/" "${LIVE_ROOT}/usr/share/lxqt/themes/Arch-Colors/"
+fi
+
+# 2) System-wide LXQt defaults
+#    - Icon theme: Breeze Dark
+#    - LXQt theme: Arch-Colors (falls back to default if not installed)
+cat > "${LIVE_ROOT}/etc/xdg/lxqt/lxqt.conf" <<'EOF'
+[General]
+icon_theme=Breeze Dark
+theme=Arch-Colors
 EOF
 
-# PATH helpers for trezor user and skel
-for HOMEBASE in "${LIVE_ROOT}/etc/skel" "${LIVE_ROOT}/home/trezor"; do
-  install -d -m0755 "${HOMEBASE}"
-  if ! grep -q 'if \[ -f ~/.bashrc \]' "${HOMEBASE}/.bash_profile" 2>/dev/null; then
-    cat >> "${HOMEBASE}/.bash_profile" <<'RC'
-if [ -f ~/.bashrc ]; then
-  . ~/.bashrc
-fi
-RC
+# ----------------------------
+# Wallpaper: use repository image
+# ----------------------------
+# Copy first supported image from /workspace/images to system backgrounds
+wall=""
+for n in background.png background.jpg wallpaper.png wallpaper.jpg trezor.png trezor.jpg; do
+  if [ -f "${SRC_IMG_DIR}/${n}" ]; then
+    wall="${n}"
+    break
   fi
-  cat >> "${HOMEBASE}/.bashrc" <<'RC'
-export PATH="/opt/trezor-scripts:$HOME/bin:$PATH"
-alias update-trezor-suite='/usr/local/bin/update-trezor-suite'
-RC
+done
+if [ -n "${wall}" ]; then
+  install -m0644 "${SRC_IMG_DIR}/${wall}" "${LIVE_ROOT}/usr/share/backgrounds/trezor/${wall}"
+  # pcmanfm-qt desktop wallpaper defaults (system-wide)
+  install -d -m0755 "${LIVE_ROOT}/etc/xdg/pcmanfm-qt/lxqt"
+  cat > "${LIVE_ROOT}/etc/xdg/pcmanfm-qt/lxqt/settings.conf" <<EOF
+[Desktop]
+wallpaper=/usr/share/backgrounds/trezor/${wall}
+wallpaper_mode=stretch
+show_wallpaper=true
+EOF
+fi
+
+# ----------------------------
+# Optional hardening: disable obvious network-y services that the spin may pull
+# (We keep this conservative to avoid breaking the session; expand if you want fully offline.)
+for s in NetworkManager-wait-online avahi-daemon cups ModemManager sshd ; do
+  chroot "${LIVE_ROOT}" systemctl disable --now "$s" 2>/dev/null || true
+  chroot "${LIVE_ROOT}" systemctl mask "$s" 2>/dev/null || true
 done
 
-# Updater helper
-cat > "${LIVE_ROOT}/usr/local/bin/update-trezor-suite" <<'EOS'
-#!/usr/bin/env bash
-set -euo pipefail
-APP="/opt/trezor/trezor-suite.AppImage"
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64|amd64) RX='linux.*(x86_64|amd64|x64).*AppImage$' ;;
-  aarch64|arm64) RX='linux.*(aarch64|arm64).*AppImage$' ;;
-  armv7l|armv7|armhf) RX='linux.*(armv7|armhf).*AppImage$' ;;
-  *) RX='AppImage$' ;;
-esac
-URL="$(curl -fsSL https://api.github.com/repos/trezor/trezor-suite/releases/latest \
-      | jq -r --arg rx "$RX" '.assets[] | select(.name|test($rx)) | .browser_download_url' | head -n1)"
-[ -n "$URL" ] || { echo "Could not determine AppImage URL for $ARCH." >&2; exit 1; }
-TMP="$(mktemp)"
-curl -fsSL -L "$URL" -o "$TMP"
-sudo install -m0755 "$TMP" "$APP"
-rm -f "$TMP"
-echo "Updated Trezor Suite at $APP"
-EOS
-chmod +x "${LIVE_ROOT}/usr/local/bin/update-trezor-suite"
-
-# Fix ownership of trezor home
-chroot "${LIVE_ROOT}" /usr/sbin/usermod -d /home/trezor -s /bin/bash trezor || true
-chroot "${LIVE_ROOT}" /usr/bin/chown -R trezor:trezor /home/trezor || true
 %end
