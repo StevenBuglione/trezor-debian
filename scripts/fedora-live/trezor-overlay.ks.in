@@ -48,7 +48,7 @@ set -euo pipefail
 LIVE_ROOT="/mnt/sysimage"
 SRC_VENDOR="/workspace/scripts/fedora-live/vendor"
 SRC_SCRIPTS="/workspace/trezor-scripts"
-SRC_THEME="/workspace/themes/Arch-Colors"
+SRC_THEME="/workspace/themes/Dark"
 SRC_IMG_DIR="/workspace/images"
 
 # Ensure dirs
@@ -98,18 +98,18 @@ EOF
 fi
 
 # ----------------------------
-# Theming: Breeze Dark + Arch-Colors
+# Theming: Breeze Dark + Dark
 # ----------------------------
-# 1) Copy Arch-Colors LXQt theme from your repo if present
+# 1) Copy Dark LXQt theme from your repo if present
 if [ -d "${SRC_THEME}" ]; then
-  rsync -a "${SRC_THEME}/" "${LIVE_ROOT}/usr/share/lxqt/themes/Arch-Colors/"
+  rsync -a "${SRC_THEME}/" "${LIVE_ROOT}/usr/share/lxqt/themes/Dark/"
 fi
 
 # 2) System-wide LXQt defaults
 cat > "${LIVE_ROOT}/etc/xdg/lxqt/lxqt.conf" <<'EOF'
 [General]
 icon_theme=Breeze Dark
-theme=Arch-Colors
+theme=Dark
 EOF
 
 # ----------------------------
