@@ -1,9 +1,12 @@
 # ==== Base: minimal live (no browsers) ====
 %include __KSDIR__/fedora-live-minimization.ks
 
-# REQUIRED by livemedia-creator --no-virt:
-url --metalink="https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever&arch=$basearch"
-repo --name=updates --metalink="https://mirrors.fedoraproject.org/metalink?repo=updates-released-f$releasever&arch=$basearch"
+# REQUIRED for --no-virt in livemedia-creator: use url (not metalink/mirrorlist)
+url --url="https://download.fedoraproject.org/pub/fedora/linux/releases/$releasever/Everything/$basearch/os/"
+repo --name=updates --url="https://download.fedoraproject.org/pub/fedora/linux/updates/$releasever/Everything/$basearch/"
+
+# Networking must be activated when using url/nfs methods
+network --bootproto=dhcp --device=link --activate
 
 # ==== Users / auth / services ====
 rootpw --lock
