@@ -15,18 +15,14 @@ xconfig --startxonboot   # (valid kickstart directive; don't try defaultdesktop=
 
 # ==== Packages: minimal LXQt Wayland + Trezor ====
 %packages
-# LXQt core
+# LXQt (Wayland-first) + basics
 lxqt-session
 lxqt-panel
 lxqt-policykit
 lxqt-themes
-
-# Wayland session + default compositor (miriway) and Xwayland shim
 lxqt-wayland-session
 lxqt-wayland-session-default-compositor-miriway
 xorg-x11-server-Xwayland
-
-# DM and a tiny terminal
 sddm
 xterm
 dejavu-sans-fonts
@@ -40,6 +36,13 @@ jq
 sudo
 ca-certificates
 rsync
+
+# REQUIRED for live ISO creation
+dracut-config-generic
+dracut-live
+-dracut-config-rescue
+grub2-efi-x64
+syslinux
 %end
 
 # ==== Post (host) — bundle AppImage if prefetched, and bundle repo scripts ====
