@@ -29,7 +29,7 @@ jobs:
       run:
         shell: bash
     env:
-      # Mirrors for live-build (Ubuntu)
+      # Mirrors
       UBUNTU_MIRROR: "http://archive.ubuntu.com/ubuntu/"
       UBUNTU_SECURITY: "http://security.ubuntu.com/ubuntu/"
       # trezor-suite repo
@@ -37,8 +37,7 @@ jobs:
       GH_REPO: "trezor-suite"
       # Output ISO name
       TAILORED_ISO_NAME: "ubuntu-live-trezor.iso"
-      # GRUB-only (avoid syslinux/gfxboot)
-      LB_BOOTLOADERS: "grub-pc grub-efi"
+      # Ensure no syslinux theme is ever requested
       LB_SYSLINUX_THEME: "none"
 
     steps:
@@ -59,7 +58,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          # NOTE: do NOT install cdebootstrap or syslinux-utils/isolinux
+          # Do not install syslinux-utils/isolinux to avoid nudging lb towards syslinux theming
           sudo apt-get install -y \
             live-build debootstrap \
             xorriso squashfs-tools genisoimage \
@@ -80,7 +79,7 @@ jobs:
           echo "VOL=UBUNTU_${CODENAME}_TREZOR" >> "$GITHUB_OUTPUT"
           echo "TAG_INPUT=$TAG_INPUT"          >> "$GITHUB_OUTPUT"
 
-      - name: Purge any lb caches/state (prevents 'precise' fallback)
+      - name: Purge any lb caches/state (prevents old distro fallback)
         run: |
           set -euxo pipefail
           sudo lb clean --purge || true
@@ -94,7 +93,7 @@ jobs:
           mkdir -p logs
           mkdir -p gnupg && chmod 700 gnupg
 
-      # ---- Write files in separate steps ----
+      # ---- Write files (separate steps to avoid heredoc issues) ----
       - name: Write package list (base.list.chroot)
         run: |
           set -euxo pipefail
@@ -258,9 +257,8 @@ jobs:
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
           echo "::group::Verify AppImage presence"; ls -l config/includes.chroot/opt/trezor/; echo "::endgroup::"
 
-      - name: Configure live-build (force noble/jammy, debootstrap, GRUB-only)
+      - name: Configure live-build (debootstrap; no syslinux theme)
         env:
-          LB_BOOTLOADERS: ${{ env.LB_BOOTLOADERS }}
           LB_SYSLINUX_THEME: ${{ env.LB_SYSLINUX_THEME }}
         run: |
           set -euxo pipefail
@@ -272,7 +270,6 @@ jobs:
             --distribution "${CODENAME}" \
             --bootstrap debootstrap \
             --binary-images iso-hybrid \
-            --bootloaders "${LB_BOOTLOADERS}" \
             --syslinux-theme "${LB_SYSLINUX_THEME}" \
             --archive-areas "main restricted universe multiverse" \
             --parent-mirror-bootstrap "${UBUNTU_MIRROR}" \
@@ -289,14 +286,16 @@ jobs:
             --iso-volume "${{ steps.vars.outputs.VOL }}" \
             --checksums "sha256"
 
-          # Double-ensure via env overrides (some lb versions read from environment)
+          # Also set env overrides (some lb versions read from here)
           cat > config/environment_chroot <<EOF
           LB_DISTRIBUTION=${CODENAME}
           LB_BOOTSTRAP=debootstrap
-          LB_BOOTLOADERS=${LB_BOOTLOADERS}
           LB_SYSLINUX_THEME=${LB_SYSLINUX_THEME}
           LB_PARENT_MIRROR_BOOTSTRAP=${UBUNTU_MIRROR}
+          LB_PARENT_MIRROR_CHROOT=${UBUNTU_MIRROR}
           LB_PARENT_MIRROR_CHROOT_SECURITY=${UBUNTU_SECURITY}
+          LB_PARENT_MIRROR_BINARY=${UBUNTU_MIRROR}
+          LB_PARENT_MIRROR_BINARY_SECURITY=${UBUNTU_SECURITY}
           EOF
 
           echo "::group::lb config dir"; ls -la config || true; echo "::endgroup::"
