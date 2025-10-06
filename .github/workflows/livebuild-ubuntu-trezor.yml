@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       ubuntu_codename:
-        description: "Ubuntu codename: jammy (22.04 LTS) or noble (24.04 LTS)"
-        default: "jammy"
+        description: "Ubuntu codename: noble (24.04 LTS) or jammy (22.04 LTS)"
+        default: "noble"
         required: true
       disable_network_by_default:
         description: "Disable NetworkManager by default in the live session"
@@ -32,12 +32,12 @@ jobs:
       # Mirrors for live-build (Ubuntu)
       UBUNTU_MIRROR: "http://archive.ubuntu.com/ubuntu/"
       UBUNTU_SECURITY: "http://security.ubuntu.com/ubuntu/"
-      # Repo for Suite
+      # trezor-suite repo
       GH_OWNER: "trezor"
       GH_REPO: "trezor-suite"
       # Output ISO name
       TAILORED_ISO_NAME: "ubuntu-live-trezor.iso"
-      # Force GRUB-only build (avoid syslinux themes entirely)
+      # GRUB-only (avoid syslinux/gfxboot)
       LB_BOOTLOADERS: "grub-pc grub-efi"
       LB_SYSLINUX_THEME: "none"
 
@@ -59,9 +59,9 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          # NOTE: we do NOT install isolinux/syslinux-utils to avoid pulling syslinux paths
+          # NOTE: do NOT install cdebootstrap or syslinux-utils/isolinux
           sudo apt-get install -y \
-            live-build debootstrap cdebootstrap \
+            live-build debootstrap \
             xorriso squashfs-tools genisoimage \
             dosfstools gpg wget curl rsync ca-certificates \
             ubuntu-keyring jq
@@ -72,7 +72,7 @@ jobs:
         id: vars
         run: |
           set -euxo pipefail
-          CODENAME="${{ github.event.inputs.ubuntu_codename || 'jammy' }}"
+          CODENAME="${{ github.event.inputs.ubuntu_codename || 'noble' }}"
           DISABLE_NET="${{ github.event.inputs.disable_network_by_default == 'true' && 'true' || 'false' }}"
           TAG_INPUT="${{ github.event.inputs.trezor_tag }}"
           echo "CODENAME=$CODENAME"            >> "$GITHUB_OUTPUT"
@@ -80,10 +80,11 @@ jobs:
           echo "VOL=UBUNTU_${CODENAME}_TREZOR" >> "$GITHUB_OUTPUT"
           echo "TAG_INPUT=$TAG_INPUT"          >> "$GITHUB_OUTPUT"
 
-      - name: Clean & create config dirs
+      - name: Purge any lb caches/state (prevents 'precise' fallback)
         run: |
           set -euxo pipefail
-          sudo lb clean || true
+          sudo lb clean --purge || true
+          sudo rm -rf cache chroot binary local || true
           rm -rf config build-cache logs gnupg || true
           mkdir -p config/includes.chroot/opt/trezor
           mkdir -p config/includes.chroot/usr/share/applications
@@ -91,7 +92,6 @@ jobs:
           mkdir -p config/package-lists
           mkdir -p config/hooks/normal
           mkdir -p logs
-          # dedicated keyring just for this workflow run
           mkdir -p gnupg && chmod 700 gnupg
 
       # ---- Write files in separate steps ----
@@ -258,20 +258,19 @@ jobs:
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
           echo "::group::Verify AppImage presence"; ls -l config/includes.chroot/opt/trezor/; echo "::endgroup::"
 
-      - name: Configure live-build (GRUB-only, no syslinux)
+      - name: Configure live-build (force noble/jammy, debootstrap, GRUB-only)
         env:
-          # Ensure lb picks these up even if flags change across versions
           LB_BOOTLOADERS: ${{ env.LB_BOOTLOADERS }}
           LB_SYSLINUX_THEME: ${{ env.LB_SYSLINUX_THEME }}
         run: |
           set -euxo pipefail
           CODENAME="${{ steps.vars.outputs.CODENAME }}"
-          sudo lb clean || true
+          sudo lb clean --purge || true
 
-          # Prefer explicit flags…
           lb config \
             --mode ubuntu \
             --distribution "${CODENAME}" \
+            --bootstrap debootstrap \
             --binary-images iso-hybrid \
             --bootloaders "${LB_BOOTLOADERS}" \
             --syslinux-theme "${LB_SYSLINUX_THEME}" \
@@ -282,16 +281,23 @@ jobs:
             --parent-mirror-binary "${UBUNTU_MIRROR}" \
             --parent-mirror-binary-security "${UBUNTU_SECURITY}" \
             --apt-recommends true \
+            --apt-secure true \
             --debian-installer false \
             --bootappend-live "boot=casper quiet splash" \
             --linux-flavours "generic" \
             --iso-application "Ubuntu Live (Trezor Suite)" \
             --iso-volume "${{ steps.vars.outputs.VOL }}" \
-            --checksums "sha256" || true
+            --checksums "sha256"
 
-          # …and force via environment too (covers older lb that ignore --syslinux-theme)
-          echo "LB_BOOTLOADERS=${LB_BOOTLOADERS}"       | tee config/environment_chroot || true
-          echo "LB_SYSLINUX_THEME=${LB_SYSLINUX_THEME}" | tee -a config/environment_chroot || true
+          # Double-ensure via env overrides (some lb versions read from environment)
+          cat > config/environment_chroot <<EOF
+          LB_DISTRIBUTION=${CODENAME}
+          LB_BOOTSTRAP=debootstrap
+          LB_BOOTLOADERS=${LB_BOOTLOADERS}
+          LB_SYSLINUX_THEME=${LB_SYSLINUX_THEME}
+          LB_PARENT_MIRROR_BOOTSTRAP=${UBUNTU_MIRROR}
+          LB_PARENT_MIRROR_CHROOT_SECURITY=${UBUNTU_SECURITY}
+          EOF
 
           echo "::group::lb config dir"; ls -la config || true; echo "::endgroup::"
 
