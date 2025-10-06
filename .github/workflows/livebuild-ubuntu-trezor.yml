@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          # Do not install syslinux-utils/isolinux to avoid nudging lb towards syslinux theming
+          # Do not install syslinux-utils/isolinux (we avoid syslinux entirely)
           sudo apt-get install -y \
             live-build debootstrap \
             xorriso squashfs-tools genisoimage \
@@ -93,7 +93,7 @@ jobs:
           mkdir -p logs
           mkdir -p gnupg && chmod 700 gnupg
 
-      # ---- Write files (separate steps to avoid heredoc issues) ----
+      # ---- Write files (separate steps to avoid heredoc pitfalls) ----
       - name: Write package list (base.list.chroot)
         run: |
           set -euxo pipefail
@@ -257,7 +257,7 @@ jobs:
           cp build-cache/trezor-suite.AppImage config/includes.chroot/opt/trezor/trezor-suite.AppImage
           echo "::group::Verify AppImage presence"; ls -l config/includes.chroot/opt/trezor/; echo "::endgroup::"
 
-      - name: Configure live-build (debootstrap; no syslinux theme)
+      - name: Configure live-build (debootstrap; no memtest; no syslinux theme)
         env:
           LB_SYSLINUX_THEME: ${{ env.LB_SYSLINUX_THEME }}
         run: |
@@ -270,6 +270,7 @@ jobs:
             --distribution "${CODENAME}" \
             --bootstrap debootstrap \
             --binary-images iso-hybrid \
+            --memtest none \
             --syslinux-theme "${LB_SYSLINUX_THEME}" \
             --archive-areas "main restricted universe multiverse" \
             --parent-mirror-bootstrap "${UBUNTU_MIRROR}" \
@@ -286,10 +287,11 @@ jobs:
             --iso-volume "${{ steps.vars.outputs.VOL }}" \
             --checksums "sha256"
 
-          # Also set env overrides (some lb versions read from here)
+          # Env overrides for older lb variants
           cat > config/environment_chroot <<EOF
           LB_DISTRIBUTION=${CODENAME}
           LB_BOOTSTRAP=debootstrap
+          LB_MEMTEST=none
           LB_SYSLINUX_THEME=${LB_SYSLINUX_THEME}
           LB_PARENT_MIRROR_BOOTSTRAP=${UBUNTU_MIRROR}
           LB_PARENT_MIRROR_CHROOT=${UBUNTU_MIRROR}
