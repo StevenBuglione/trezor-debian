@@ -25,8 +25,7 @@ jobs:
       ARCH: amd64
       ISO_BASENAME: debian-live-trezor
       ISO_LABEL: DEBIAN_bookworm_TREZOR
-      # SatoshiLabs 2021 key (release signature’s VALIDSIG must match this)
-      TREZOR_FPR: "EB483B26B078A4AA1B6F425EE21B6950A2ECB65C"
+      TREZOR_FPR: "EB483B26B078A4AA1B6F425EE21B6950A2ECB65C"   # SatoshiLabs 2021 key
       TREZOR_KEY_URL: "https://trezor.io/security/satoshilabs-2021-signing-key.asc"
       TREZOR_UDEV_URL: "https://data.trezor.io/udev/51-trezor.rules"
 
@@ -55,6 +54,7 @@ jobs:
           mkdir -p config/includes.chroot/etc/udev/rules.d
           mkdir -p config/hooks/normal
           mkdir -p config/package-lists
+          mkdir -p config/archives
           mkdir -p logs build-cache auto
 
       - name: Package list (XFCE + essentials)
@@ -87,7 +87,7 @@ jobs:
           Categories=Finance;Utility;
           EOF
 
-      # --- Authenticated GitHub Release Assets download (avoids 403/rate-limit) ---
+      # --- Authenticated GitHub Release Assets download (avoids 403) ---
       - name: Fetch Trezor Suite assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -157,10 +157,9 @@ jobs:
           [[ "${GOODSIG:-0}" -ge 1 && -n "$SIG_FPR" && "$SIG_FPR" == "$TREZOR_FPR" ]] || {
             echo "Signature failed or fingerprint mismatch"; exit 5; }
 
-      - name: Post-install hook (AppImage perms) + APT sources sanitizer
+      - name: Post-install hook (AppImage perms) + APT security sanitizer
         run: |
           set -euo pipefail
-          # Ensure AppImage is executable
           cat > config/hooks/normal/00-post-install.chroot <<'EOF'
           #!/bin/bash
           set -euo pipefail
@@ -168,22 +167,32 @@ jobs:
           EOF
           chmod +x config/hooks/normal/00-post-install.chroot
 
-          # Sanitize any stale 'bookworm/updates' security lines if some tool inserts them
+          # Fix any accidental 'bookworm/updates' to 'bookworm-security' inside the image.
           cat > config/hooks/normal/05-fix-security-sources.chroot <<'EOF'
           #!/bin/bash
           set -euo pipefail
           for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
-            [ -e "$f" ] || continue
-            sed -i -E 's#(deb\\s+.*debian-security)\\s+bookworm/updates(\\s.*)#\\1 bookworm-security\\2#g' "$f" || true
+            [[ -e "$f" ]] || continue
+            sed -i -E 's#(deb\s+.*debian-security)\s+bookworm/updates(\s.*)#\1 bookworm-security\2#g' "$f" || true
           done
           EOF
           chmod +x config/hooks/normal/05-fix-security-sources.chroot
 
-      - name: Configure live-build (disable default security; we add the correct one)
+      # --- create security list BEFORE lb config (avoid root-owned config issues) ---
+      - name: Add debian-security list (no duplicates)
         run: |
           set -euo pipefail
-          sudo lb clean --purge || true
-          sudo lb config noauto \
+          install -d config/archives
+          cat > config/archives/01security.list.chroot <<'EOF'
+          deb http://deb.debian.org/debian-security bookworm-security main contrib non-free-firmware
+          EOF
+          cp config/archives/01security.list.chroot config/archives/01security.list.binary
+
+      - name: Configure live-build (user-owned config; no sudo)
+        run: |
+          set -euo pipefail
+          lb clean --purge || true
+          lb config noauto \
             --mode debian \
             --architectures "${ARCH}" \
             --distribution "${SUITE}" \
@@ -206,12 +215,8 @@ jobs:
             --iso-volume "${ISO_LABEL}" \
             --checksums sha256
 
-          # Add only the *security* entry via sources.list.d to avoid duplicates.
-          mkdir -p config/archives
-          cat > config/archives/01security.list.chroot <<'EOF'
-          deb http://deb.debian.org/debian-security bookworm-security main contrib non-free-firmware
-          EOF
-          cp config/archives/01security.list.chroot config/archives/01security.list.binary
+      # If you ever need to write into a root-owned config/, use sudo tee:
+      #   echo "deb http://... bookworm-security main" | sudo tee config/archives/01security.list.chroot >/dev/null
 
       - name: Build ISO (verbose)
         run: |
@@ -230,7 +235,7 @@ jobs:
           mv "$ISO" "$OUT"
           sha256sum "$OUT" | tee "${OUT}.sha256"
 
-      - name: Upload artifacts (ISO + logs + config)
+      - name: Upload artifacts (ISO + logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
