@@ -49,8 +49,9 @@ jobs:
                       -H "Accept: application/vnd.github+json" \
                       "$URL" -o release.json
 
-          APP_URL=$(jq -r '.assets[] | select(.name|test("AppImage$")) | .browser_download_url' release.json | head -n1)
-          ASC_URL=$(jq -r '.assets[] | select(.name|test("AppImage.asc$")) | .browser_download_url' release.json | head -n1)
+          APP_URL=$(jq -r '.assets[] | select(.name|test("linux.*(x86_64|amd64|x64).*AppImage$")) | .browser_download_url' release.json | head -n1)
+          ASC_URL=$(jq -r '.assets[] | select(.name|test("linux.*(x86_64|amd64|x64).*AppImage.asc$")) | .browser_download_url' release.json | head -n1)
+
           if [ -z "${APP_URL}" ] || [ -z "${ASC_URL}" ]; then
             echo "Could not find AppImage assets in release:" >&2
             jq -r '.assets[]?.name' release.json || true
