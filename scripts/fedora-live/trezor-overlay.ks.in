@@ -1,15 +1,29 @@
-# Base: official LXQt Live spin (pulls in live compose deps)
-%include __KSDIR__/fedora-live-lxqt.ks
+# Base: minimal live image scaffolding (no LXQt comps)
+%include __KSDIR__/fedora-live-base.ks
 
-# Users / auth (use the spin's default liveuser for reliable boot/login)
+# Users / auth
 rootpw --lock
 firstboot --disable
 selinux --enforcing
 firewall --disabled
 
-# Extra packages we need (and explicit removals)
+# ----------------------------
+# Packages: GNOME core (minimal) + Trezor + basics
+# ----------------------------
 %packages
-# Needed for Trezor + helpers
+# GNOME session + display manager
+gdm
+gnome-shell
+gnome-session
+
+# We will run GNOME on Xorg for deterministic display scripting
+# (keep Xwayland harmlessly present if needed by apps)
+xorg-x11-server-Xorg
+xorg-x11-server-Xwayland
+xorg-x11-drv-libinput
+xrandr
+
+# Trezor + helpers
 trezor-common
 fuse-libs
 curl
@@ -18,79 +32,64 @@ sudo
 ca-certificates
 rsync
 
-# ----- X11 session stack (force Xorg) -----
-# Remove Wayland compositor pieces
--lxqt-wayland-session
--lxqt-wayland-session-default-compositor-miriway
--xorg-x11-server-Xwayland
-
-# Ensure Xorg + input + display manager
-xorg-x11-server-Xorg
-xorg-x11-drv-libinput
-xorg-x11-xinit
-sddm
-
-# Theming + file manager for desktop/wallpaper
-breeze-icon-theme
-pcmanfm-qt
-lxqt-config
-
-# Purge browsers and obvious extras (keep this list lean)
+# Strip extras you don't want
 -firefox
 -chromium
--falkon
--lynx
--w3m
--transmission
--epiphany
--enki
--konqueror
--qupzilla
+-gnome-software
+-gnome-tour
+-cheese
+-rhythmbox
+-totem
+-simple-scan
+-yelp
+-gedit
+-gnome-boxes
 %end
 
-# Host-side post: copy artifacts, bundle scripts, set themes/wallpaper/icon (no network)
+
+# ----------------------------
+# Post: stage artifacts, icon, autostart, force Xorg, pin display
+# ----------------------------
 %post --nochroot --log=/root/trezor-post.log
 set -euo pipefail
 
 LIVE_ROOT="/mnt/sysimage"
 SRC_VENDOR="/workspace/scripts/fedora-live/vendor"
 SRC_SCRIPTS="/workspace/trezor-scripts"
-SRC_THEME="/workspace/themes/Dark"
 SRC_IMG_DIR="/workspace/images"
 
-# Ensure dirs
-install -d -m0755 "${LIVE_ROOT}/opt/trezor" \
-                   "${LIVE_ROOT}/opt/trezor-scripts" \
-                   "${LIVE_ROOT}/usr/share/applications" \
-                   "${LIVE_ROOT}/usr/local/bin" \
-                   "${LIVE_ROOT}/etc/xdg/autostart" \
-                   "${LIVE_ROOT}/etc/xdg/lxqt" \
-                   "${LIVE_ROOT}/usr/share/backgrounds/trezor" \
-                   "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps" \
-                   "${LIVE_ROOT}/etc/sddm.conf.d"
+install -d -m0755 \
+  "${LIVE_ROOT}/opt/trezor" \
+  "${LIVE_ROOT}/opt/trezor-scripts" \
+  "${LIVE_ROOT}/usr/share/applications" \
+  "${LIVE_ROOT}/usr/local/bin" \
+  "${LIVE_ROOT}/etc/xdg/autostart" \
+  "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps" \
+  "${LIVE_ROOT}/etc/gdm" \
+  "${LIVE_ROOT}/etc/skel/.config" \
+  "${LIVE_ROOT}/var/lib/gdm/.config" \
+  "${LIVE_ROOT}/var/lib/gdm/seat0/config"
 
-# If prefetched on the host, vendor them in (optional)
+# Vendor Trezor Suite artifacts if present
 [ -f "${SRC_VENDOR}/trezor-suite.AppImage" ]     && install -m0755 "${SRC_VENDOR}/trezor-suite.AppImage"     "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage"     || true
 [ -f "${SRC_VENDOR}/trezor-suite.AppImage.asc" ] && install -m0644 "${SRC_VENDOR}/trezor-suite.AppImage.asc" "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage.asc" || true
 [ -f "${SRC_VENDOR}/trezor.asc" ]                && install -m0644 "${SRC_VENDOR}/trezor.asc"                "${LIVE_ROOT}/opt/trezor/trezor.asc"                || true
 
-# Bundle YOUR repo scripts (exclude VCS junk), make executable
+# Bundle your repo scripts (exclude VCS junk)
 if [ -d "${SRC_SCRIPTS}" ]; then
   rsync -a --delete --exclude ".git" --exclude ".github" --exclude ".gitmodules" --exclude "*.md" \
     "${SRC_SCRIPTS}/" "${LIVE_ROOT}/opt/trezor-scripts/"
   find "${LIVE_ROOT}/opt/trezor-scripts" -type f -name "*.sh" -exec chmod 0755 {} \;
 fi
 
-# ----------------------------
-# App icon: install PNG into hicolor and update cache
-# ----------------------------
+# Icon (optional)
 if [ -f "${SRC_IMG_DIR}/trezor-suite.png" ]; then
   install -m0644 "${SRC_IMG_DIR}/trezor-suite.png" \
     "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps/trezor-suite.png"
 fi
 chroot "${LIVE_ROOT}" bash -lc 'command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f /usr/share/icons/hicolor || true'
 
-# Desktop launcher for Trezor Suite (assumes AppImage is embedded by CI)
+# Desktop launcher
 if [ -x "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage" ]; then
   cat > "${LIVE_ROOT}/usr/share/applications/trezor-suite.desktop" <<'EOF'
 [Desktop Entry]
@@ -105,57 +104,80 @@ EOF
 fi
 
 # ----------------------------
-# Theming: Breeze Dark + Dark
+# Force GNOME to run on Xorg (so xrandr works predictably)
 # ----------------------------
-# 1) Copy Dark LXQt theme from your repo if present
-if [ -d "${SRC_THEME}" ]; then
-  rsync -a "${SRC_THEME}/" "${LIVE_ROOT}/usr/share/lxqt/themes/Dark/"
-fi
-
-# 2) System-wide LXQt defaults
-cat > "${LIVE_ROOT}/etc/xdg/lxqt/lxqt.conf" <<'EOF'
-[General]
-icon_theme=Breeze Dark
-theme=Dark
+cat > "${LIVE_ROOT}/etc/gdm/custom.conf" <<'EOF'
+[daemon]
+WaylandEnable=false
+DefaultSession=gnome-xorg.desktop
 EOF
+chroot "${LIVE_ROOT}" systemctl enable gdm || true
+chroot "${LIVE_ROOT}" systemctl set-default graphical.target || true
 
 # ----------------------------
-# Wallpaper: use repository image
+# Set default display: DP-1, 2560x1440, landscape, primary
+# 1) Apply at user login via xrandr (autostart)
 # ----------------------------
-wall=""
-for n in background.png background.jpg wallpaper.png wallpaper.jpg trezor.png trezor.jpg; do
-  if [ -f "${SRC_IMG_DIR}/${n}" ]; then
-    wall="${n}"
-    break
+cat > "${LIVE_ROOT}/usr/local/bin/set-display.sh" <<'EOF'
+#!/usr/bin/env bash
+# Try to set DP-1 to 2560x1440@60, primary, normal orientation
+# If DP-1 not present, do nothing (avoid blocking login)
+if command -v xrandr >/dev/null 2>&1; then
+  if xrandr | grep -qE '(^|\s)DP-1(\s|$)'; then
+    xrandr --output DP-1 --mode 2560x1440 --rate 60 --primary --rotate normal || true
   fi
-done
-if [ -n "${wall}" ]; then
-  install -m0644 "${SRC_IMG_DIR}/${wall}" "${LIVE_ROOT}/usr/share/backgrounds/trezor/${wall}"
-  # pcmanfm-qt desktop wallpaper defaults (system-wide)
-  install -d -m0755 "${LIVE_ROOT}/etc/xdg/pcmanfm-qt/lxqt"
-  cat > "${LIVE_ROOT}/etc/xdg/pcmanfm-qt/lxqt/settings.conf" <<EOF
-[Desktop]
-wallpaper=/usr/share/backgrounds/trezor/${wall}
-wallpaper_mode=stretch
-show_wallpaper=true
-EOF
 fi
+EOF
+chmod 0755 "${LIVE_ROOT}/usr/local/bin/set-display.sh"
 
-# ----------------------------
-# Force SDDM to X11 + LXQt session
-# ----------------------------
-cat > "${LIVE_ROOT}/etc/sddm.conf.d/00-displayserver.conf" <<'EOF'
-[General]
-DisplayServer=x11
-Session=lxqt.desktop
+cat > "${LIVE_ROOT}/etc/xdg/autostart/00-set-display.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Set Display Layout (DP-1 2560x1440)
+Exec=/usr/local/bin/set-display.sh
+OnlyShowIn=GNOME;
+X-GNOME-Autostart-enabled=true
 EOF
 
 # ----------------------------
-# Optional hardening: quiet down network-y services the spin may pull
+# 2) Also seed GDM/login-screen & default user profile with monitors.xml
+#    (so login greeter prefers DP-1 at 2560x1440)
+# ----------------------------
+cat > "${LIVE_ROOT}/etc/skel/.config/monitors.xml" <<'EOF'
+<monitors version="2">
+  <configuration>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>1</scale>
+      <primary>yes</primary>
+      <transform>normal</transform>
+      <monitor>
+        <monitorspec>
+          <connector>DP-1</connector>
+        </monitorspec>
+        <mode>
+          <width>2560</width>
+          <height>1440</height>
+          <rate>60.0</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>
+EOF
+
+# For the GDM login screen (both modern and legacy paths)
+install -m0644 "${LIVE_ROOT}/etc/skel/.config/monitors.xml" "${LIVE_ROOT}/var/lib/gdm/.config/monitors.xml"
+install -d -m0755 "${LIVE_ROOT}/var/lib/gdm/seat0/config"
+install -m0644 "${LIVE_ROOT}/etc/skel/.config/monitors.xml" "${LIVE_ROOT}/var/lib/gdm/seat0/config/monitors.xml"
+chroot "${LIVE_ROOT}" bash -lc 'chown -R gdm:gdm /var/lib/gdm/.config /var/lib/gdm/seat0 || true'
+
+# ----------------------------
+# Quiet down network-y services (optional)
 # ----------------------------
 for s in NetworkManager-wait-online avahi-daemon cups ModemManager sshd ; do
   chroot "${LIVE_ROOT}" systemctl disable --now "$s" 2>/dev/null || true
   chroot "${LIVE_ROOT}" systemctl mask "$s" 2>/dev/null || true
 done
-
 %end
