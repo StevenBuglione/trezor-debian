@@ -1,5 +1,5 @@
-# Base: minimal live image scaffolding (no LXQt comps)
-%include __KSDIR__/fedora-live-base.ks
+# Base: official Workstation live KS (brings all live dracut bits)
+%include __KSDIR__/fedora-live-workstation.ks
 
 # Users / auth
 rootpw --lock
@@ -7,32 +7,8 @@ firstboot --disable
 selinux --enforcing
 firewall --disabled
 
-# Services: avoid anaconda enabling ModemManager; ensure GDM/graphical/NM are on
-services --enabled=gdm,NetworkManager --disabled=ModemManager,NetworkManager-wait-online,avahi-daemon,cups,sshd
-
-# ----------------------------
-# Packages: GNOME core (minimal) + Trezor + basics + live boot deps
-# ----------------------------
+# Packages (add xrandr for Xorg path; rest as you had)
 %packages
-# GNOME session + display manager
-gdm
-gnome-shell
-gnome-session
-
-# We will run GNOME on Xorg for deterministic display scripting
-xorg-x11-server-Xorg
-xorg-x11-server-Xwayland
-xorg-x11-drv-libinput
-xrandr
-
-# Networking core
-NetworkManager
-
-# Live boot dependencies to satisfy livenet/url-lib helper (get_url_handler)
-dracut-live
-dracut-network
-
-# Trezor + helpers
 trezor-common
 fuse-libs
 curl
@@ -40,86 +16,48 @@ jq
 sudo
 ca-certificates
 rsync
+xrandr
 
-# Strip extras (keep the image lean)
--firefox
--chromium
--gnome-software
--gnome-tour
+# Optional removals to slim image
+-gnome-boxes
 -cheese
 -rhythmbox
 -totem
 -simple-scan
 -yelp
--gedit
--gnome-boxes
+-gnome-tour
 %end
 
 # ----------------------------
-# Post (CHROOT): force required dracut modules into initramfs
-# ----------------------------
-%post --log=/root/trezor-dracut.log
-set -euo pipefail
-
-# Ensure the live modules are present even if lorax doesn't auto-detect them
-install -d -m0755 /etc/dracut.conf.d
-cat >/etc/dracut.conf.d/90-live.conf <<'EOF'
-# Make sure live boot paths are available at early boot
-add_dracutmodules+=" dmsquash-live livenet url-lib "
-EOF
-
-# Rebuild initramfs for the installed kernel (harmless if lorax rebuilds later)
-if rpm -q kernel-core >/dev/null 2>&1; then
-  kver="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-core | tail -n1)"
-  dracut -f "/boot/initramfs-${kver}.img" "${kver}" || true
-fi
-%end
-
-# ----------------------------
-# Post (NOCHROOT): stage artifacts, icon, autostart, force Xorg, pin display
+# Stage Suite + desktop file + display prefs (no-chroot)
 # ----------------------------
 %post --nochroot --log=/root/trezor-post.log
 set -euo pipefail
 
 LIVE_ROOT="/mnt/sysimage"
 SRC_VENDOR="/workspace/scripts/fedora-live/vendor"
-SRC_SCRIPTS="/workspace/trezor-scripts"
 SRC_IMG_DIR="/workspace/images"
 
 install -d -m0755 \
   "${LIVE_ROOT}/opt/trezor" \
-  "${LIVE_ROOT}/opt/trezor-scripts" \
   "${LIVE_ROOT}/usr/share/applications" \
+  "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps" \
   "${LIVE_ROOT}/usr/local/bin" \
   "${LIVE_ROOT}/etc/xdg/autostart" \
-  "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps" \
-  "${LIVE_ROOT}/etc/gdm" \
   "${LIVE_ROOT}/etc/skel/.config" \
   "${LIVE_ROOT}/var/lib/gdm/.config" \
   "${LIVE_ROOT}/var/lib/gdm/seat0/config"
 
-# Vendor Trezor Suite artifacts if present
-[ -f "${SRC_VENDOR}/trezor-suite.AppImage" ]     && install -m0755 "${SRC_VENDOR}/trezor-suite.AppImage"     "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage"     || true
-[ -f "${SRC_VENDOR}/trezor-suite.AppImage.asc" ] && install -m0644 "${SRC_VENDOR}/trezor-suite.AppImage.asc" "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage.asc" || true
-[ -f "${SRC_VENDOR}/trezor.asc" ]                && install -m0644 "${SRC_VENDOR}/trezor.asc"                "${LIVE_ROOT}/opt/trezor/trezor.asc"                || true
+# --- Trezor Suite bits ---
+[ -f "${SRC_VENDOR}/trezor-suite.AppImage" ] && \
+  install -m0755 "${SRC_VENDOR}/trezor-suite.AppImage" \
+    "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage" || true
 
-# Bundle your repo scripts (exclude VCS junk)
-if [ -d "${SRC_SCRIPTS}" ]; then
-  rsync -a --delete --exclude ".git" --exclude ".github" --exclude ".gitmodules" --exclude "*.md" \
-    "${SRC_SCRIPTS}/" "${LIVE_ROOT}/opt/trezor-scripts/"
-  find "${LIVE_ROOT}/opt/trezor-scripts" -type f -name "*.sh" -exec chmod 0755 {} \;
-fi
-
-# Icon (optional)
-if [ -f "${SRC_IMG_DIR}/trezor-suite.png" ]; then
+[ -f "${SRC_IMG_DIR}/trezor-suite.png" ] && \
   install -m0644 "${SRC_IMG_DIR}/trezor-suite.png" \
-    "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps/trezor-suite.png"
-fi
-chroot "${LIVE_ROOT}" bash -lc 'command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f /usr/share/icons/hicolor || true'
+    "${LIVE_ROOT}/usr/share/icons/hicolor/scalable/apps/trezor-suite.png" || true
 
-# Desktop launcher
-if [ -x "${LIVE_ROOT}/opt/trezor/trezor-suite.AppImage" ]; then
-  cat > "${LIVE_ROOT}/usr/share/applications/trezor-suite.desktop" <<'EOF'
+cat > "${LIVE_ROOT}/usr/share/applications/trezor-suite.desktop" <<'EOF'
 [Desktop Entry]
 Name=Trezor Suite
 Comment=Manage your Trezor hardware wallet
@@ -129,38 +67,10 @@ Terminal=false
 Type=Application
 Categories=Finance;Utility;
 EOF
-fi
 
-# Force GNOME to run on Xorg (so xrandr works predictably)
-cat > "${LIVE_ROOT}/etc/gdm/custom.conf" <<'EOF'
-[daemon]
-WaylandEnable=false
-DefaultSession=gnome-xorg.desktop
-EOF
-chroot "${LIVE_ROOT}" systemctl enable gdm || true
-chroot "${LIVE_ROOT}" systemctl set-default graphical.target || true
+# --- Display configuration ---
 
-# Set default display: DP-1, 2560x1440@60, primary, landscape
-cat > "${LIVE_ROOT}/usr/local/bin/set-display.sh" <<'EOF'
-#!/usr/bin/env bash
-if command -v xrandr >/dev/null 2>&1; then
-  if xrandr | grep -qE '(^|\s)DP-1(\s|$)'; then
-    xrandr --output DP-1 --mode 2560x1440 --rate 60 --primary --rotate normal || true
-  fi
-fi
-EOF
-chmod 0755 "${LIVE_ROOT}/usr/local/bin/set-display.sh"
-
-cat > "${LIVE_ROOT}/etc/xdg/autostart/00-set-display.desktop" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=Set Display Layout (DP-1 2560x1440)
-Exec=/usr/local/bin/set-display.sh
-OnlyShowIn=GNOME;
-X-GNOME-Autostart-enabled=true
-EOF
-
-# Seed GNOME/GDM monitors.xml to prefer DP-1 at greeter too
+# 1) Seed GNOME display layout for Wayland (and greeter):
 cat > "${LIVE_ROOT}/etc/skel/.config/monitors.xml" <<'EOF'
 <monitors version="2">
   <configuration>
@@ -184,13 +94,47 @@ cat > "${LIVE_ROOT}/etc/skel/.config/monitors.xml" <<'EOF'
   </configuration>
 </monitors>
 EOF
-install -m0644 "${LIVE_ROOT}/etc/skel/.config/monitors.xml" "${LIVE_ROOT}/var/lib/gdm/.config/monitors.xml"
-install -d -m0755 "${LIVE_ROOT}/var/lib/gdm/seat0/config"
-install -m0644 "${LIVE_ROOT}/etc/skel/.config/monitors.xml" "${LIVE_ROOT}/var/lib/gdm/seat0/config/monitors.xml"
+
+install -m0644 "${LIVE_ROOT}/etc/skel/.config/monitors.xml" \
+  "${LIVE_ROOT}/var/lib/gdm/.config/monitors.xml"
+install -m0644 "${LIVE_ROOT}/etc/skel/.config/monitors.xml" \
+  "${LIVE_ROOT}/var/lib/gdm/seat0/config/monitors.xml"
 chroot "${LIVE_ROOT}" bash -lc 'chown -R gdm:gdm /var/lib/gdm/.config /var/lib/gdm/seat0 || true'
 
-# Final hardening: keep these quiet at runtime too
-for s in NetworkManager-wait-online avahi-daemon cups ModemManager sshd ; do
-  chroot "${LIVE_ROOT}" systemctl mask "$s" 2>/dev/null || true
-done
+# 2) Autostart helper for Xorg sessions (no-op on Wayland):
+cat > "${LIVE_ROOT}/usr/local/bin/set-display.sh" <<'EOF'
+#!/usr/bin/env bash
+# Run only on Xorg; Wayland GNOME uses the seeded monitors.xml instead.
+if [ "${XDG_SESSION_TYPE:-}" = "x11" ] || [ -n "${DISPLAY:-}" ]; then
+  if command -v xrandr >/dev/null 2>&1; then
+    if xrandr | grep -qE '(^|\s)DP-1(\s|$)'; then
+      xrandr --output DP-1 --mode 2560x1440 --rate 60 --primary --rotate normal || true
+    fi
+  fi
+fi
+exit 0
+EOF
+chmod 0755 "${LIVE_ROOT}/usr/local/bin/set-display.sh"
+
+cat > "${LIVE_ROOT}/etc/xdg/autostart/00-set-display.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Set Display Layout (DP-1 2560x1440)
+Exec=/usr/local/bin/set-display.sh
+OnlyShowIn=GNOME;
+X-GNOME-Autostart-enabled=true
+EOF
+
+# 3) (Optional) If you want to force Xorg for deterministic xrandr, uncomment:
+# cat > "${LIVE_ROOT}/etc/gdm/custom.conf" <<'EOF'
+# [daemon]
+# WaylandEnable=false
+# DefaultSession=gnome-xorg.desktop
+# EOF
+# chroot "${LIVE_ROOT}" systemctl enable gdm || true
+# chroot "${LIVE_ROOT}" systemctl set-default graphical.target || true
+
+# Refresh icon cache if available
+chroot "${LIVE_ROOT}" bash -lc 'command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f /usr/share/icons/hicolor || true'
+
 %end
