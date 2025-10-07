@@ -7,6 +7,9 @@ firstboot --disable
 selinux --enforcing
 firewall --disabled
 
+# Services: avoid anaconda enabling ModemManager; ensure GDM/graphical/NM are on
+services --enabled=gdm,NetworkManager --disabled=ModemManager,NetworkManager-wait-online,avahi-daemon,cups,sshd
+
 # ----------------------------
 # Packages: GNOME core (minimal) + Trezor + basics
 # ----------------------------
@@ -17,11 +20,13 @@ gnome-shell
 gnome-session
 
 # We will run GNOME on Xorg for deterministic display scripting
-# (keep Xwayland harmlessly present if needed by apps)
 xorg-x11-server-Xorg
 xorg-x11-server-Xwayland
 xorg-x11-drv-libinput
 xrandr
+
+# Networking core
+NetworkManager
 
 # Trezor + helpers
 trezor-common
@@ -32,7 +37,7 @@ sudo
 ca-certificates
 rsync
 
-# Strip extras you don't want
+# Strip extras (keep the image lean)
 -firefox
 -chromium
 -gnome-software
@@ -45,7 +50,6 @@ rsync
 -gedit
 -gnome-boxes
 %end
-
 
 # ----------------------------
 # Post: stage artifacts, icon, autostart, force Xorg, pin display
@@ -103,9 +107,7 @@ Categories=Finance;Utility;
 EOF
 fi
 
-# ----------------------------
 # Force GNOME to run on Xorg (so xrandr works predictably)
-# ----------------------------
 cat > "${LIVE_ROOT}/etc/gdm/custom.conf" <<'EOF'
 [daemon]
 WaylandEnable=false
@@ -114,14 +116,9 @@ EOF
 chroot "${LIVE_ROOT}" systemctl enable gdm || true
 chroot "${LIVE_ROOT}" systemctl set-default graphical.target || true
 
-# ----------------------------
-# Set default display: DP-1, 2560x1440, landscape, primary
-# 1) Apply at user login via xrandr (autostart)
-# ----------------------------
+# Set default display: DP-1, 2560x1440@60, primary, landscape
 cat > "${LIVE_ROOT}/usr/local/bin/set-display.sh" <<'EOF'
 #!/usr/bin/env bash
-# Try to set DP-1 to 2560x1440@60, primary, normal orientation
-# If DP-1 not present, do nothing (avoid blocking login)
 if command -v xrandr >/dev/null 2>&1; then
   if xrandr | grep -qE '(^|\s)DP-1(\s|$)'; then
     xrandr --output DP-1 --mode 2560x1440 --rate 60 --primary --rotate normal || true
@@ -139,10 +136,7 @@ OnlyShowIn=GNOME;
 X-GNOME-Autostart-enabled=true
 EOF
 
-# ----------------------------
-# 2) Also seed GDM/login-screen & default user profile with monitors.xml
-#    (so login greeter prefers DP-1 at 2560x1440)
-# ----------------------------
+# Seed GNOME/GDM monitors.xml to prefer DP-1 at greeter too
 cat > "${LIVE_ROOT}/etc/skel/.config/monitors.xml" <<'EOF'
 <monitors version="2">
   <configuration>
@@ -166,18 +160,13 @@ cat > "${LIVE_ROOT}/etc/skel/.config/monitors.xml" <<'EOF'
   </configuration>
 </monitors>
 EOF
-
-# For the GDM login screen (both modern and legacy paths)
 install -m0644 "${LIVE_ROOT}/etc/skel/.config/monitors.xml" "${LIVE_ROOT}/var/lib/gdm/.config/monitors.xml"
 install -d -m0755 "${LIVE_ROOT}/var/lib/gdm/seat0/config"
 install -m0644 "${LIVE_ROOT}/etc/skel/.config/monitors.xml" "${LIVE_ROOT}/var/lib/gdm/seat0/config/monitors.xml"
 chroot "${LIVE_ROOT}" bash -lc 'chown -R gdm:gdm /var/lib/gdm/.config /var/lib/gdm/seat0 || true'
 
-# ----------------------------
-# Quiet down network-y services (optional)
-# ----------------------------
+# Final hardening: keep these quiet at runtime too
 for s in NetworkManager-wait-online avahi-daemon cups ModemManager sshd ; do
-  chroot "${LIVE_ROOT}" systemctl disable --now "$s" 2>/dev/null || true
   chroot "${LIVE_ROOT}" systemctl mask "$s" 2>/dev/null || true
 done
 %end
