@@ -30,8 +30,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq gnupg
+
       - name: Prepare output dir
-        run: mkdir -p out
+        run: mkdir -p out scripts/fedora-live/vendor
 
       - name: Prefetch Trezor Suite (host-side) + signing key
         id: trezor_prefetch
@@ -39,7 +45,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p scripts/fedora-live/vendor
           TAG="${{ github.event.inputs.trezor_tag }}"
           API="https://api.github.com/repos/trezor/trezor-suite/releases"
           URL="${API}/latest"
@@ -51,8 +56,8 @@ jobs:
                       "$URL" -o release.json
 
           # Extract Trezor Suite version info
-          TREZOR_VERSION=$(jq -r '.tag_name // .name // .id' release.json)
-          if [ -z "${TREZOR_VERSION}" ] || [ "${TREZOR_VERSION}" = "null" ]; then
+          TREZOR_VERSION=$(jq -r '.tag_name // .name // .id // empty' release.json)
+          if [ -z "${TREZOR_VERSION}" ]; then
             echo "Failed to extract Trezor Suite version" >&2
             exit 1
           fi
@@ -111,7 +116,7 @@ jobs:
             -e TREZOR_TAG="${TREZOR_TAG_INPUT}" \
             "${IMG}" bash /workspace/scripts/fedora-live/build-fedora-live-trezor.sh
 
-      - name: Compute Checksums
+      - name: Compute checksums
         run: |
           set -euo pipefail
           cd out
@@ -121,31 +126,33 @@ jobs:
           done
           ls -lh
 
+      - name: Collect artifact metadata (iso name/size/hash)
+        id: artifact_meta
+        run: |
+          set -euo pipefail
+          ISO_PATH="$(ls -1 out/*.iso | head -n1)"
+          ISO_NAME="$(basename "$ISO_PATH")"
+          ISO_SIZE_HUMAN="$(du -h "$ISO_PATH" | awk '{print $1}')"
+          ISO_SHA256="$(sha256sum "$ISO_PATH" | awk '{print $1}')"
+          echo "iso_name=${ISO_NAME}" >> "$GITHUB_OUTPUT"
+          echo "iso_size=${ISO_SIZE_HUMAN}" >> "$GITHUB_OUTPUT"
+          echo "iso_sha256=${ISO_SHA256}" >> "$GITHUB_OUTPUT"
+
       - name: Derive Fedora version & arch (for release notes)
         id: meta
         env:
           FED_INPUT: ${{ github.event.inputs.fedora_major }}
         run: |
           set -euo pipefail
-
-          # Arch from host is fine (build outputs x86_64 ISO)
           ARCH="$(uname -m)"
-
-          # If user supplied a Fedora major, trust it; else query a short-lived Fedora container
           if [ -n "${FED_INPUT}" ]; then
             FEDORA_VERSION="${FED_INPUT}"
           else
             FEDORA_VERSION="$(docker run --rm fedora:latest bash -lc 'source /etc/os-release && echo ${VERSION_ID}')"
           fi
-
-          # Sanity fallback
-          if [ -z "${FEDORA_VERSION}" ]; then FEDORA_VERSION="unknown"; fi
-
+          [ -n "${FEDORA_VERSION}" ] || FEDORA_VERSION="unknown"
           echo "arch=${ARCH}" >> "$GITHUB_OUTPUT"
           echo "fedora_version=${FEDORA_VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Show outputs
-        run: ls -lh out || true
 
       - name: Upload artifacts (CI browsing convenience)
         uses: actions/upload-artifact@v4
@@ -154,18 +161,19 @@ jobs:
           path: out
           retention-days: 14
 
-      # Create or update a GitHub Release and upload ISO + checksums
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.meta.outputs.fedora_version }}-trezor-${{ steps.trezor_prefetch.outputs.trezor_version }}-${{ github.run_number }}
-          name: Fedora ${{ steps.meta.outputs.fedora_version }} + Trezor Suite ${{ steps.trezor_prefetch.outputs.trezor_version }} (arch: ${{ steps.meta.outputs.arch }})
+          name: Fedora ${{ steps.meta.outputs.fedora_version }} + Trezor Suite ${{ steps.trezor_prefetch.outputs.trezor_version }} (arch - ${{ steps.meta.outputs.arch }})
           body: |
             ## Fedora Live ISO with Trezor Suite
 
             **Fedora Version:** ${{ steps.meta.outputs.fedora_version }}  
             **Trezor Suite Version:** ${{ steps.trezor_prefetch.outputs.trezor_version }}  
-            **Architecture:** ${{ steps.meta.outputs.arch }}
+            **Architecture:** ${{ steps.meta.outputs.arch }}  
+            **Image:** `${{ steps.artifact_meta.outputs.iso_name }}` (${% raw %}${{ steps.artifact_meta.outputs.iso_size }}{% endraw %})  
+            **SHA256:** `${{ steps.artifact_meta.outputs.iso_sha256 }}`
 
             ### What’s inside
             - Fedora Live environment, pre-bundled with Trezor Suite AppImage
@@ -178,14 +186,14 @@ jobs:
                ```bash
                sha256sum -c *.iso.sha256
                ```
-            3. Flash the ISO to a USB (e.g., with `dd`, Fedora Media Writer, or Balena Etcher).
+            3. Flash the ISO to a USB (e.g., Fedora Media Writer, Balena Etcher, or `dd`).
             4. Boot the target machine from USB.
 
             ### Notes
-            - If you entered only the **first 4 letters** of each BIP-39 word during recovery, Trezor Suite will auto-complete (BIP-39 rule).
+            - BIP-39 seed words are uniquely identified by their first four letters; Trezor supports 4-letter entry during recovery.
             - For long-term backups, full words are safest for cross-tool compatibility.
 
-            _Built automatically by CI on ${{ github.workflow }} run #${{ github.run_number }}._
+            _Built by ${{ github.workflow }} run #${{ github.run_number }}._
           draft: false
           prerelease: false
           files: |
