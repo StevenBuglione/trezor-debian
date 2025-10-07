@@ -11,7 +11,7 @@ firewall --disabled
 services --enabled=gdm,NetworkManager --disabled=ModemManager,NetworkManager-wait-online,avahi-daemon,cups,sshd
 
 # ----------------------------
-# Packages: GNOME core (minimal) + Trezor + basics
+# Packages: GNOME core (minimal) + Trezor + basics + live boot deps
 # ----------------------------
 %packages
 # GNOME session + display manager
@@ -27,6 +27,10 @@ xrandr
 
 # Networking core
 NetworkManager
+
+# Live boot dependencies to satisfy livenet/url-lib helper (get_url_handler)
+dracut-live
+dracut-network
 
 # Trezor + helpers
 trezor-common
@@ -52,7 +56,27 @@ rsync
 %end
 
 # ----------------------------
-# Post: stage artifacts, icon, autostart, force Xorg, pin display
+# Post (CHROOT): force required dracut modules into initramfs
+# ----------------------------
+%post --log=/root/trezor-dracut.log
+set -euo pipefail
+
+# Ensure the live modules are present even if lorax doesn't auto-detect them
+install -d -m0755 /etc/dracut.conf.d
+cat >/etc/dracut.conf.d/90-live.conf <<'EOF'
+# Make sure live boot paths are available at early boot
+add_dracutmodules+=" dmsquash-live livenet url-lib "
+EOF
+
+# Rebuild initramfs for the installed kernel (harmless if lorax rebuilds later)
+if rpm -q kernel-core >/dev/null 2>&1; then
+  kver="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-core | tail -n1)"
+  dracut -f "/boot/initramfs-${kver}.img" "${kver}" || true
+fi
+%end
+
+# ----------------------------
+# Post (NOCHROOT): stage artifacts, icon, autostart, force Xorg, pin display
 # ----------------------------
 %post --nochroot --log=/root/trezor-post.log
 set -euo pipefail
